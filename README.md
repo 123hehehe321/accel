@@ -292,6 +292,31 @@ sudo ./accel
 - ✅ 各种错误有明确提示
 - ⚠️ 此时**速度和直连相当**（因为还没加速算法）
 
+### 6.3 快速体验第一步
+
+第一步已经编译好了二进制，放在 `binaries` 分支，可以直接下载试跑（**还没有加速效果**，本节只为验证基础设施能跑起来）：
+
+```bash
+# 1. 下载
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/accel
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/acc.conf.example
+chmod +x accel
+mv acc.conf.example acc.conf
+
+# 2. 改配置 —— ⚠️ 建议第一次只测一个不重要的端口，别动 22 (SSH)，出问题会失联
+vim acc.conf          # 把 ports 先改成 "8888" 之类的单端口
+                      # interface 改成 `ip link show` 看到的实际网卡名
+
+# 3. 启动（前台，Ctrl+C 退出）
+sudo ./accel
+
+# 4. 另开一个终端查状态
+./accel status        # 看 pkt_total / pkt_accel / accel_ratio
+./accel stop          # 优雅退出
+```
+
+确认 `accel status` 里 `pkt_accel` 数字在涨，说明 eBPF 分流工作正常。后续 2.1 完成后才能看到流量真正被用户态处理。
+
 ---
 
 ## 7. 第一步：eBPF 分流
