@@ -1,0 +1,71 @@
+# accel - 高性能服务器端 TCP 加速器
+#
+# 这是项目的 Cargo 配置文件，声明项目元信息和 Rust 依赖。
+#
+# ⚠️ 重要说明：
+#   此文件只包含"第一步"需要的依赖。
+#   - 第一步：aya-rs (eBPF 加载)、anyhow (错误处理)、toml/serde (配置解析)
+#   - 子阶段 2.1 需要加的依赖：xsk-rs、monoio (到时候用 cargo add 添加)
+#   - 子阶段 2.2 需要加的依赖：smoltcp (到时候用 cargo add 添加)
+#
+# 不要现在就把所有依赖加进来，避免过早锁定版本和编译时间。
+
+[package]
+name = "accel"
+version = "0.1.0"
+edition = "2021"
+authors = ["123hehehe321"]
+description = "High-performance server-side TCP accelerator using eBPF/XDP + smoltcp"
+repository = "https://github.com/123hehehe321/accel"
+license = "MIT"
+readme = "README.md"
+
+# ──────────────────────────────────────────────────────────
+# 第一步依赖（eBPF 分流阶段需要的）
+# ──────────────────────────────────────────────────────────
+#
+# 这些依赖的版本号使用 "*" 占位。
+# Claude Code 在实际开发时，请用 `cargo add <crate>` 让 Cargo 自动选择
+# 当前最新的兼容版本。写死版本号会过时。
+[dependencies]
+
+# aya-rs: Rust 原生的 eBPF 框架
+# 用于加载 classifier.c 编译出的 eBPF 字节码
+aya = "*"
+
+# anyhow: 应用层错误处理
+anyhow = "*"
+
+# toml + serde: 解析 acc.conf 配置文件
+toml = "*"
+serde = { version = "*", features = ["derive"] }
+
+# libc: 与系统调用交互（信号处理、Unix Socket 等）
+libc = "*"
+
+# ──────────────────────────────────────────────────────────
+# 后续阶段的依赖（不要现在就加，到阶段开始时再加）
+# ──────────────────────────────────────────────────────────
+#
+# [子阶段 2.1] AF_XDP 收包阶段，开始时执行：
+#   cargo add xsk-rs
+#   cargo add monoio
+#
+# [子阶段 2.2] smoltcp 转发阶段，开始时执行：
+#   cargo add smoltcp --no-default-features --features="std,medium-ip,proto-ipv4,socket-tcp"
+
+# ──────────────────────────────────────────────────────────
+# 构建配置
+# ──────────────────────────────────────────────────────────
+
+[profile.release]
+# 发布构建：最大优化 + 体积精简
+opt-level = 3
+lto = true           # 链接时优化
+codegen-units = 1    # 单编译单元，性能最佳但编译慢
+strip = true         # 剥离调试符号，减小体积
+panic = "abort"      # 减小体积（panic 时直接退出）
+
+[profile.dev]
+# 开发构建：保持可调试性，但也优化一下让测试可用
+opt-level = 1        # 轻量优化（纯 debug 会让 eBPF 相关代码慢得离谱）
