@@ -12,9 +12,11 @@ fn main() {
     let output = out_dir.join("classifier.o");
 
     let mut cmd = Command::new("clang");
-    // No -g: clang 18 emits BTF relocations that aya 0.13 rejects.
-    // We don't need debug info for Day 2's minimal program.
-    cmd.args(["-target", "bpf", "-O2"]);
+    // -g is required: libbpf-style map definitions (__uint/__type macros) are
+    // encoded into the .BTF section. Without it aya fails with "no BTF parsed".
+    // After compilation we strip .BTF.ext (CO-RE relocations aya 0.13 can't
+    // handle) and DWARF debug sections.
+    cmd.args(["-target", "bpf", "-O2", "-g"]);
 
     // <linux/bpf.h> pulls in <asm/types.h>, which on Debian/Ubuntu lives in
     // the multiarch include dir. Clang doesn't scan it by default when the
@@ -38,6 +40,7 @@ fn main() {
     };
 
     if out.status.success() {
+        strip_unneeded_sections(&output);
         return;
     }
 
@@ -45,12 +48,36 @@ fn main() {
     if stderr.contains("unknown target") && stderr.contains("bpf") {
         fail("clang does not support -target bpf. upgrade clang to >= 10");
     }
+    if stderr.contains("'bpf/bpf_helpers.h' file not found") {
+        fail("bpf/bpf_helpers.h not found. install with: sudo apt install libbpf-dev");
+    }
 
     // Forward clang's own error output unchanged — it already points at the
     // offending line in classifier.c.
     eprintln!("error: failed to compile {SOURCE}");
     eprint!("{stderr}");
     std::process::exit(1);
+}
+
+fn strip_unneeded_sections(obj: &Path) {
+    let strip = Command::new("llvm-strip")
+        .args(["--remove-section=.BTF.ext", "--strip-debug"])
+        .arg(obj)
+        .output();
+    match strip {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            eprintln!(
+                "error: llvm-strip failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            std::process::exit(1);
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            fail("llvm-strip not found. install with: sudo apt install llvm");
+        }
+        Err(e) => fail(&format!("failed to invoke llvm-strip: {e}")),
+    }
 }
 
 fn fail(msg: &str) -> ! {

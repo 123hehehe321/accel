@@ -42,6 +42,7 @@ serde = { version = "1", features = ["derive"] }
 
 # libc: 与系统调用交互（信号处理、Unix Socket 等）
 libc = "*"
+ctrlc = { version = "3.5.2", features = ["termination"] }
 
 # ──────────────────────────────────────────────────────────
 # 后续阶段的依赖（不要现在就加，到阶段开始时再加）
