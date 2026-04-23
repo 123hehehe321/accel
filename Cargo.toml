@@ -34,11 +34,11 @@ readme = "README.md"
 aya = "*"
 
 # anyhow: 应用层错误处理
-anyhow = "*"
+anyhow = "1"
 
 # toml + serde: 解析 acc.conf 配置文件
-toml = "*"
-serde = { version = "*", features = ["derive"] }
+toml = "1"
+serde = { version = "1", features = ["derive"] }
 
 # libc: 与系统调用交互（信号处理、Unix Socket 等）
 libc = "*"
