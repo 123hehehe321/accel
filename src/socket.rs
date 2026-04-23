@@ -1,0 +1,128 @@
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+
+use crate::status::{self, State};
+
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn resolve_path(cfg_socket: &str) -> PathBuf {
+    if !cfg_socket.is_empty() {
+        return PathBuf::from(cfg_socket);
+    }
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        let dir = PathBuf::from("/run/accel");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir.join("accel.sock");
+        }
+        eprintln!("warning: cannot create /run/accel/, falling back to ./accel.sock");
+    }
+    PathBuf::from("./accel.sock")
+}
+
+/// Startup-time check: if the socket file exists and a listener is there,
+/// another accel is already running. If the file exists but connect fails,
+/// it's stale — we unlink so bind can succeed.
+pub fn prepare_path(path: &Path) -> Result<()> {
+    match UnixStream::connect(path) {
+        Ok(_) => bail!(
+            "another accel is already running on {} (use './accel stop' first)",
+            path.display()
+        ),
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+            // stale socket file
+            std::fs::remove_file(path).ok();
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("checking existing socket at {}", path.display())),
+    }
+}
+
+pub fn bind(path: &Path) -> Result<UnixListener> {
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("binding Unix socket at {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 on {}", path.display()))?;
+    Ok(listener)
+}
+
+/// Blocking accept loop. Runs in the dedicated socket thread. On fatal
+/// accept errors, signals the main thread to shut down and returns.
+pub fn serve(listener: UnixListener, state: Arc<State>, shutdown_tx: Sender<()>) {
+    loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                let stop_requested = handle(stream, &state);
+                if stop_requested {
+                    let _ = shutdown_tx.send(());
+                    return;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("error: socket accept failed: {e}, shutting down accel");
+                let _ = shutdown_tx.send(());
+                return;
+            }
+        }
+    }
+}
+
+/// Handle one client. Returns true iff the client issued `stop`.
+fn handle(stream: UnixStream, state: &State) -> bool {
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: socket try_clone failed: {e}, dropping client");
+            return false;
+        }
+    };
+    let mut reader = BufReader::new(reader_stream);
+    let mut writer = stream;
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    let cmd = line.trim();
+    match cmd {
+        "status" => {
+            let text = status::render(state);
+            let _ = writer.write_all(text.as_bytes());
+            false
+        }
+        "stop" => {
+            let _ = writer.write_all(b"stopping\n");
+            true
+        }
+        other => {
+            let _ = writeln!(writer, "error: unknown command: {other}");
+            false
+        }
+    }
+}
+
+/// Client side: connect to the socket and write one command, then stream
+/// the response to stdout. Returns the exit code for the CLI.
+pub fn client_roundtrip(path: &Path, cmd: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(path).with_context(|| {
+        format!(
+            "cannot connect to {} — is accel running?",
+            path.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    writeln!(stream, "{cmd}")?;
+    let mut stdout = io::stdout().lock();
+    io::copy(&mut stream, &mut stdout)?;
+    Ok(())
+}
