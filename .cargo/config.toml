@@ -1,17 +1,17 @@
 [env]
 # libbpf-sys (transitive dep of libbpf-rs) compiles vendored libbpf via the
 # host C compiler. For the musl target, musl-gcc's default include search
-# path doesn't cover the multiarch kernel uapi headers shipped by the
-# linux-libc-dev package (they live under /usr/include/x86_64-linux-gnu/).
-# Point the C compiler there so <asm/unistd.h> / <asm/types.h> resolve.
+# path does NOT cover either of the two places kernel uapi headers live
+# on Debian/Ubuntu:
+#   /usr/include/x86_64-linux-gnu/    — arch-specific (<asm/*>)
+#   /usr/include/                     — arch-neutral   (<asm-generic/*>, <linux/*>)
+# Both are shipped by the linux-libc-dev package.
 #
-# We use -idirafter (not -I) so the path is consulted LAST, after musl's
-# own includes. Using -I here prepends the dir and lets glibc's bits/*
-# internals shadow musl's (struct flock redefinition, missing
-# linux/errno.h). With -idirafter, musl's own headers win every normal
-# include; only uapi headers that musl doesn't ship (asm/*.h) fall
-# through to the multiarch glibc dir.
+# We add both via -idirafter (fallback path, lowest priority) so:
+#   - musl's own <bits/*>, <fcntl.h>, <errno.h> etc. resolve first
+#     (using -I instead would let glibc's bits/* shadow musl's and
+#      break the build with struct flock redefinition).
+#   - only headers musl doesn't ship (kernel uapi) fall through.
 #
-# uapi headers are libc-agnostic by design, so reusing glibc's multiarch
-# copy to build a musl target is the standard Debian/Ubuntu fix.
-CFLAGS_x86_64_unknown_linux_musl = "-idirafter /usr/include/x86_64-linux-gnu"
+# This is the canonical libbpf + musl cross-compile recipe on Debian.
+CFLAGS_x86_64_unknown_linux_musl = "-idirafter /usr/include/x86_64-linux-gnu -idirafter /usr/include"
