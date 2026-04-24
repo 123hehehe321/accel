@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use crate::algo;
 use crate::status::{self, State};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,11 +104,64 @@ fn handle(stream: UnixStream, state: &State) -> bool {
             let _ = writer.write_all(b"stopping\n");
             true
         }
+        "algo_list" => {
+            let _ = writer.write_all(render_algo_list(state).as_bytes());
+            false
+        }
+        other if other.starts_with("algo_switch ") => {
+            let name = other["algo_switch ".len()..].trim();
+            match handle_algo_switch(name, state) {
+                Ok(()) => {
+                    let _ = writeln!(writer, "ok: switched to {name}");
+                }
+                Err(e) => {
+                    let _ = writeln!(writer, "error: {e:#}");
+                }
+            }
+            false
+        }
         other => {
             let _ = writeln!(writer, "error: unknown command: {other}");
             false
         }
     }
+}
+
+fn render_algo_list(state: &State) -> String {
+    let available = algo::list_available()
+        .map(|v| v.join(" "))
+        .unwrap_or_else(|e| format!("? ({e})"));
+    let target = state
+        .target_algo
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "?".to_string());
+    let active_v4 = algo::current_cc_ipv4().unwrap_or_else(|_| "?".to_string());
+    let loaded = state
+        .algo
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|a| a.name.to_string()))
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "available: {available}\n\
+         loaded by accel: {loaded}\n\
+         target:    {target}\n\
+         active:    {active_v4} (ipv4)\n"
+    )
+}
+
+/// Set sysctl to `name` and update the daemon's target so health.rs
+/// (2.1-D5) keeps it locked in.
+fn handle_algo_switch(name: &str, state: &State) -> Result<()> {
+    if name.is_empty() {
+        bail!("missing algorithm name (usage: algo_switch NAME)");
+    }
+    algo::set_cc_both(name)?;
+    if let Ok(mut t) = state.target_algo.lock() {
+        *t = name.to_string();
+    }
+    Ok(())
 }
 
 /// Client side: connect to the socket and write one command, then stream

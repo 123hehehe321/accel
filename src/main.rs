@@ -1,3 +1,4 @@
+mod algo;
 mod cli;
 mod config;
 mod ebpf_loader;

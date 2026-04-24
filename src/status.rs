@@ -1,23 +1,52 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::algo;
+use crate::ebpf_loader::LoadedAlgo;
 
 /// Shared state published to the socket server for status requests.
 ///
-/// Day 2 carries only the truly invariant fields. The algorithm / health
-/// related fields land here in Day 4 as the real struct_ops loading goes in.
+/// - `algo` holds the registered struct_ops link; dropping it
+///   unregisters. `Option<_>` because 2.1-D5 health.rs will take / replace
+///   the inner value during reload. Wrapped in `Arc<Mutex<_>>` so the
+///   socket thread can read it while main owns the canonical reference.
+/// - `target_algo` is the name accel *wants* to be active on IPv4+IPv6.
+///   Changes when `./accel algo switch` is called. 2.1-D5 health.rs will
+///   compare this with the kernel sysctl and re-apply if drift is
+///   detected.
 pub struct State {
     pub pid: u32,
     pub started_at: Instant,
     pub socket_path: PathBuf,
+    pub algo: Arc<Mutex<Option<LoadedAlgo>>>,
+    pub target_algo: Arc<Mutex<String>>,
 }
 
 pub fn render(state: &State) -> String {
     let uptime = state.started_at.elapsed();
     let cpu_pct = read_cpu_pct(uptime).unwrap_or(-1.0);
     let mem_mb = read_rss_mb().unwrap_or(0);
-    let kernel_cc = read_kernel_cc().unwrap_or_else(|| "?".into());
+
+    let loaded_name = state
+        .algo
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|a| a.name.to_string()));
+    let target = state
+        .target_algo
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "?".to_string());
+
+    let available = algo::list_available()
+        .map(|v| v.join(" "))
+        .unwrap_or_else(|_| "?".to_string());
+    let sysctl_v4 = algo::current_cc_ipv4().unwrap_or_else(|_| "?".to_string());
+    let sysctl_v6 = algo::current_cc_ipv6();
+    let jit = read_jit_state();
 
     let version = concat!(
         env!("CARGO_PKG_VERSION_MAJOR"),
@@ -27,22 +56,52 @@ pub fn render(state: &State) -> String {
 
     let mut s = String::new();
     let _ = writeln!(s, "accel status:");
-    let _ = writeln!(s, "  version:     {version}");
-    let _ = writeln!(s, "  running:     yes (pid={})", state.pid);
-    let _ = writeln!(s, "  uptime:      {}", format_uptime(uptime));
-    let _ = writeln!(s, "  socket:      {}", state.socket_path.display());
+    let _ = writeln!(s, "  version:       {version}");
+    let _ = writeln!(s, "  running:       yes (pid={})", state.pid);
+    let _ = writeln!(s, "  uptime:        {}", format_uptime(uptime));
+    let _ = writeln!(s, "  socket:        {}", state.socket_path.display());
     let _ = writeln!(s);
     let _ = writeln!(s, "algorithm:");
-    let _ = writeln!(s, "  loaded:      none (migration in progress, 2.1-D3 checkpoint)");
-    let _ = writeln!(s, "  active:      {kernel_cc} (kernel default)");
-    let _ = writeln!(s, "  note:        skeleton embedded; runtime load lands in 2.1-D4");
+    match &loaded_name {
+        Some(n) => {
+            let _ = writeln!(s, "  loaded:        {n}");
+        }
+        None => {
+            let _ = writeln!(s, "  loaded:        none");
+        }
+    }
+    let _ = writeln!(s, "  target:        {target}");
+    match &sysctl_v6 {
+        Some(v6) => {
+            let _ = writeln!(
+                s,
+                "  kernel sysctl: {sysctl_v4} (ipv4) / {v6} (ipv6)"
+            );
+        }
+        None => {
+            let _ = writeln!(s, "  kernel sysctl: {sysctl_v4} (ipv4)");
+        }
+    }
+    let _ = writeln!(s, "  available:     {available}");
+    let _ = writeln!(s, "  jit:           {jit}");
+
+    // Sysctl / target mismatch hint — 2.1-D5 health.rs will auto-reconcile;
+    // D4 only reports.
+    if sysctl_v4 != target {
+        let _ = writeln!(
+            s,
+            "  WARNING:       kernel sysctl ({sysctl_v4}) differs from target ({target}); \
+             2.1-D5 health check will reconcile, currently manual"
+        );
+    }
+
     let _ = writeln!(s);
     if cpu_pct >= 0.0 {
-        let _ = writeln!(s, "  cpu:         {cpu_pct:.1}%");
+        let _ = writeln!(s, "  cpu:           {cpu_pct:.1}%");
     } else {
-        let _ = writeln!(s, "  cpu:         ?");
+        let _ = writeln!(s, "  cpu:           ?");
     }
-    let _ = writeln!(s, "  mem:         {mem_mb} MB");
+    let _ = writeln!(s, "  mem:           {mem_mb} MB");
     s
 }
 
@@ -57,10 +116,14 @@ fn read_rss_mb() -> Option<u64> {
     None
 }
 
-fn read_kernel_cc() -> Option<String> {
-    fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control")
-        .ok()
-        .map(|s| s.trim().to_string())
+fn read_jit_state() -> &'static str {
+    match fs::read_to_string("/proc/sys/net/core/bpf_jit_enable") {
+        Ok(v) => match v.trim().parse::<u32>().unwrap_or(0) {
+            0 => "disabled",
+            _ => "enabled",
+        },
+        Err(_) => "?",
+    }
 }
 
 /// Cumulative CPU% since process start. One-shot read, no sampling thread.
