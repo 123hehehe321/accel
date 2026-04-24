@@ -2,12 +2,17 @@
 
 这个分支只放编译好的二进制。源代码在 `main` 分支。
 
-## 当前版本:2.1-D6 (glibc 2.34 build)
+## 当前版本:2.1-D6.1 (glibc 2.34 build)
 
 - **Day 6 bug fix**:之前 `./accel stop` 后 sysctl 停留在 accel_cubic,
   新连接继续选不存在的 accel_cubic。现在启动时 capture 原 sysctl,
   clean shutdown 顺序 restore sysctl → drop Link → drop Skel,
   新连接立即回到原 CC 算法。status 新增 `will restore to: X` 字段。
+- **Day 6.1**:edge case — 若启动时 sysctl 已经是 accel_cubic
+  (上次异常退出遗留),capture 自动降级到 bbr / cubic / reno 之一,
+  保证 clean shutdown 的 restore 永远能成功。README §12.5 文档化
+  stop 后 `bpftool struct_ops show` 可能短期残留的内核 socket-pinning
+  行为(不是 bug,是 graceful shutdown)。
 - **阶段**:2.1 Day 5 — health 自愈 + incident 日志
 - **新增(D4 → D5)**:
   * **自动恢复**:外部 `bpftool struct_ops unregister accel_cubic` 后,
