@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,19 +11,25 @@ use crate::ebpf_loader::LoadedAlgo;
 /// Shared state published to the socket server for status requests.
 ///
 /// - `algo` holds the registered struct_ops link; dropping it
-///   unregisters. `Option<_>` because 2.1-D5 health.rs will take / replace
-///   the inner value during reload. Wrapped in `Arc<Mutex<_>>` so the
-///   socket thread can read it while main owns the canonical reference.
-/// - `target_algo` is the name accel *wants* to be active on IPv4+IPv6.
-///   Changes when `./accel algo switch` is called. 2.1-D5 health.rs will
-///   compare this with the kernel sysctl and re-apply if drift is
-///   detected.
+///   unregisters. `Option<_>` because 2.1-D5 health.rs takes / replaces
+///   the inner value during reload.
+/// - `target_algo` is the name accel *wants* active on IPv4+IPv6. It
+///   changes on `./accel algo switch`; `health.rs` reconciles kernel
+///   sysctl back to it on drift.
+/// - `health_shutting_down` is flipped by main before cleanup so the
+///   health thread exits its tick loop within 500 ms.
+/// - `health_last_ok` is the wall-clock time of the last completed
+///   health tick (None until the first tick).
+/// - `jit_warned` suppresses JIT-disabled log spam across ticks.
 pub struct State {
     pub pid: u32,
     pub started_at: Instant,
     pub socket_path: PathBuf,
     pub algo: Arc<Mutex<Option<LoadedAlgo>>>,
     pub target_algo: Arc<Mutex<String>>,
+    pub health_shutting_down: AtomicBool,
+    pub health_last_ok: Mutex<Option<Instant>>,
+    pub jit_warned: AtomicBool,
 }
 
 pub fn render(state: &State) -> String {
@@ -96,6 +103,10 @@ pub fn render(state: &State) -> String {
     }
 
     let _ = writeln!(s);
+    let _ = writeln!(s, "reliability:");
+    render_reliability(state, &mut s);
+
+    let _ = writeln!(s);
     if cpu_pct >= 0.0 {
         let _ = writeln!(s, "  cpu:           {cpu_pct:.1}%");
     } else {
@@ -103,6 +114,68 @@ pub fn render(state: &State) -> String {
     }
     let _ = writeln!(s, "  mem:           {mem_mb} MB");
     s
+}
+
+fn render_reliability(state: &State, s: &mut String) {
+    let uptime = state.started_at.elapsed();
+    let _ = writeln!(s, "  current uptime:  {}", format_uptime(uptime));
+
+    // Stats from the incident log.
+    let (restarts, last_reason) = incident_history_summary();
+    let _ = writeln!(s, "  restarts:        {restarts}");
+    let _ = writeln!(s, "  last shutdown:   {last_reason}");
+
+    // Health tick age.
+    let hc = match state.health_last_ok.lock() {
+        Ok(g) => g.map(|t| t.elapsed()),
+        Err(_) => None,
+    };
+    match hc {
+        Some(d) => {
+            let secs = d.as_secs();
+            let _ = writeln!(
+                s,
+                "  health check:    every 30s, last ok {secs}s ago"
+            );
+        }
+        None => {
+            let _ = writeln!(s, "  health check:    every 30s, first tick pending");
+        }
+    }
+
+    // Path to the log so users know where to look.
+    if let Some(p) = crate::incidents::path() {
+        let _ = writeln!(s, "  incident log:    {}", p.display());
+    }
+}
+
+/// Cheap one-pass scan of the incident log to produce two numbers:
+/// number of `startup` records seen (= total restarts logged) and the
+/// reason field of the most recent `shutdown` record. Anything fancier
+/// (per-event-type counts, 7-day windows) can be added later if users
+/// actually want it.
+fn incident_history_summary() -> (usize, String) {
+    let Some(path) = crate::incidents::path() else {
+        return (0, "unknown".to_string());
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return (0, "none".to_string());
+    };
+    let mut restarts = 0usize;
+    let mut last_reason: Option<String> = None;
+    for line in text.lines() {
+        if line.contains("| startup") {
+            restarts += 1;
+        } else if line.contains("| shutdown") {
+            if let Some(r) = line.split("reason=").nth(1) {
+                last_reason = Some(r.trim().to_string());
+            }
+        }
+    }
+    (
+        restarts,
+        last_reason.unwrap_or_else(|| "none".to_string()),
+    )
 }
 
 fn read_rss_mb() -> Option<u64> {

@@ -1,6 +1,7 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,7 +9,8 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::{algo, config, ebpf_loader, socket, status};
+use crate::incidents::{self, Event};
+use crate::{algo, config, ebpf_loader, health, socket, status};
 
 const CONFIG_PATH: &str = "./acc.conf";
 
@@ -80,7 +82,7 @@ fn run_algo(args: &[String]) -> Result<()> {
 }
 
 fn run_server() -> Result<()> {
-    println!("hello accel (v0.2, 2.1-D4)");
+    println!("hello accel (v0.2, 2.1-D5)");
     println!();
 
     let cfg = config::load(Path::new(CONFIG_PATH))?;
@@ -98,6 +100,33 @@ fn run_server() -> Result<()> {
     println!("    socket   = {socket_display}");
     println!();
 
+    // Incident log initialization and startup record, *before* any side
+    // effect so the startup row always makes it to disk.
+    incidents::init(incidents::resolve_path());
+    let kernel = incidents::read_kernel_release();
+    let last_shutdown = incidents::last_shutdown_reason();
+    incidents::append(Event::Startup {
+        pid: std::process::id(),
+        kernel: kernel.clone(),
+        last_shutdown: last_shutdown.clone(),
+    })
+    .context("writing startup incident")?;
+    println!("incident log: {}", incidents::path().unwrap().display());
+    println!("  kernel:        {kernel}");
+    println!("  last shutdown: {last_shutdown}");
+
+    // Startup-time health probes that only fire once per process.
+    if let Some(prev) = scan_dmesg_oom() {
+        let _ = incidents::append(Event::OomKilled {
+            previous_pid: Some(prev),
+        });
+        eprintln!("warning: dmesg shows a previous accel pid={prev} killed by OOM");
+    }
+    if !jit_enabled() {
+        let _ = incidents::append(Event::JitDisabled);
+    }
+    println!();
+
     println!("{}", ebpf_loader::skeleton_info());
 
     // Load + register the struct_ops algorithm BEFORE binding the socket,
@@ -107,8 +136,6 @@ fn run_server() -> Result<()> {
     println!("  registered as struct_ops: {}", loaded.name);
 
     // Apply sysctl so the kernel uses our algorithm for new connections.
-    // `cfg.algorithm.default` must match a registered algorithm — for 2.1-D4
-    // that's `accel_cubic` (the only one we load).
     let target_name = cfg.algorithm.default.clone();
     algo::set_cc_both(&target_name).with_context(|| {
         format!("setting sysctl tcp_congestion_control={target_name}")
@@ -135,6 +162,9 @@ fn run_server() -> Result<()> {
         socket_path: socket_path.clone(),
         algo: Arc::new(Mutex::new(Some(loaded))),
         target_algo: Arc::new(Mutex::new(target_name)),
+        health_shutting_down: AtomicBool::new(false),
+        health_last_ok: Mutex::new(None),
+        jit_warned: AtomicBool::new(false),
     });
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
@@ -156,6 +186,9 @@ fn run_server() -> Result<()> {
         })
         .context("spawning socket thread")?;
 
+    // Health thread.
+    health::spawn(Arc::clone(&state)).context("spawning health thread")?;
+
     // SIGINT / SIGTERM handler.
     let signal_tx = shutdown_tx.clone();
     ctrlc::set_handler(move || {
@@ -168,13 +201,45 @@ fn run_server() -> Result<()> {
     let _ = shutdown_rx.recv();
 
     println!("shutting down...");
+    // Stop the health thread before we tear down the algo it monitors.
+    state.health_shutting_down.store(true, Ordering::Relaxed);
     // Explicitly drop the algo while state is reachable, so unregister-
-    // related log lines land before socket removal. `take()` lets the
-    // Drop fire at end of scope.
+    // related log lines land before socket removal.
     if let Some(algo) = state.algo.lock().ok().and_then(|mut g| g.take()) {
         println!("unregistering struct_ops {}...", algo.name);
         drop(algo);
     }
     let _ = std::fs::remove_file(&socket_path);
+    let _ = incidents::append(Event::Shutdown { reason: "clean" });
     Ok(())
+}
+
+/// Scan `dmesg` for the most recent "Killed process <pid> (accel)" line,
+/// indicating the previous run died to OOM. Returns the victim pid if
+/// found. Best-effort: needs root and a recent ring buffer, silently
+/// returns None if dmesg can't be read.
+fn scan_dmesg_oom() -> Option<u32> {
+    let out = Command::new("dmesg").output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines().rev() {
+        let lower = line.to_lowercase();
+        if lower.contains("killed process") && lower.contains("(accel") {
+            // Pattern: "... Killed process 12345 (accel) ..."
+            if let Some(tail) = lower.split("killed process").nth(1) {
+                if let Some(pid_str) = tail.split_whitespace().next() {
+                    return pid_str.parse().ok();
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn jit_enabled() -> bool {
+    std::fs::read_to_string("/proc/sys/net/core/bpf_jit_enable")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true)
 }
