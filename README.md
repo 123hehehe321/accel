@@ -2,13 +2,16 @@
 
 这个分支只放编译好的二进制。源代码在 `main` 分支。
 
-## 当前版本:2.1-D4
+## 当前版本:2.1-D4 (glibc 2.34 build)
 
 - **阶段**:2.1 Day 4 — struct_ops 加载 + algo CLI + 完整 status
 - **功能**:载入 `accel_cubic`(BPF CUBIC 移植)并设 sysctl;
   支持 `./accel algo list / switch`。
 - **加速效果**:等效 CUBIC(就是抄的 CUBIC),**没有加速提升**。
   真实提升要等 2.2(`accel_bbr`)和第三步(`accel_brutal`)。
+- **兼容性**:glibc 2.34 底线,覆盖 Debian 12 (glibc 2.36) / 
+  Debian 13 / Ubuntu 22.04+ / 任何 glibc ≥ 2.34 的 x86_64 Linux。
+  (早前的 Day 4 binary 要 glibc 2.38+,用户 VPS 跑不了,已弃用。)
 
 ## ⚠️ 内核要求:Linux 6.4+
 
