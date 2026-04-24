@@ -1,0 +1,10 @@
+[env]
+# libbpf-sys (transitive dep of libbpf-rs) compiles vendored libbpf via the
+# host C compiler. For the musl target, musl-gcc's default include search
+# path doesn't cover the multiarch kernel uapi headers shipped by the
+# linux-libc-dev package (they live under /usr/include/x86_64-linux-gnu/).
+# Point the C compiler there so <asm/unistd.h> / <asm/types.h> resolve.
+#
+# uapi headers are libc-agnostic by design, so using glibc's multiarch
+# copy to compile a musl target is the standard Debian/Ubuntu fix.
+CFLAGS_x86_64_unknown_linux_musl = "-I/usr/include/x86_64-linux-gnu"
