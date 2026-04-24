@@ -48,18 +48,28 @@ pub fn current_cc_ipv6() -> Option<String> {
 /// anyway, but we give a nicer error). IPv6 is best-effort: if the sysctl
 /// is absent we silently skip.
 pub fn set_cc_both(name: &str) -> Result<()> {
-    if !is_registered(name)? {
+    set_cc(name, Some(name))
+}
+
+/// Like [`set_cc_both`] but lets the caller pass distinct IPv4 and IPv6
+/// names — used at shutdown to restore whatever the kernel had *before*
+/// accel started (v4 and v6 may differ in principle, though in practice
+/// they track one another).
+pub fn set_cc(v4: &str, v6: Option<&str>) -> Result<()> {
+    if !is_registered(v4)? {
         bail!(
-            "algorithm '{name}' is not registered in {AVAILABLE} (load it first via './accel'; \
+            "algorithm '{v4}' is not registered in {AVAILABLE} (load it first via './accel'; \
              currently available: {})",
             list_available()?.join(" ")
         );
     }
-    fs::write(SYSCTL_V4, name)
-        .with_context(|| format!("writing '{name}' to {SYSCTL_V4}"))?;
-    if Path::new(SYSCTL_V6).exists() {
-        // Best-effort: v6 may fail on some weird configs; don't abort the main switch.
-        let _ = fs::write(SYSCTL_V6, name);
+    fs::write(SYSCTL_V4, v4)
+        .with_context(|| format!("writing '{v4}' to {SYSCTL_V4}"))?;
+    if let Some(v6_name) = v6 {
+        if Path::new(SYSCTL_V6).exists() {
+            // Best-effort: v6 may fail on some weird configs; don't abort.
+            let _ = fs::write(SYSCTL_V6, v6_name);
+        }
     }
     Ok(())
 }

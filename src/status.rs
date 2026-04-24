@@ -16,6 +16,11 @@ use crate::ebpf_loader::LoadedAlgo;
 /// - `target_algo` is the name accel *wants* active on IPv4+IPv6. It
 ///   changes on `./accel algo switch`; `health.rs` reconciles kernel
 ///   sysctl back to it on drift.
+/// - `original_cc_ipv4` / `original_cc_ipv6` capture the kernel's CC
+///   algorithm *before* accel started. On clean shutdown we restore
+///   sysctl to this value so new connections don't keep getting routed
+///   through accel_cubic after accel is gone. `None` if the capture
+///   failed at startup (rare; sysctl read error).
 /// - `health_shutting_down` is flipped by main before cleanup so the
 ///   health thread exits its tick loop within 500 ms.
 /// - `health_last_ok` is the wall-clock time of the last completed
@@ -27,6 +32,8 @@ pub struct State {
     pub socket_path: PathBuf,
     pub algo: Arc<Mutex<Option<LoadedAlgo>>>,
     pub target_algo: Arc<Mutex<String>>,
+    pub original_cc_ipv4: Option<String>,
+    pub original_cc_ipv6: Option<String>,
     pub health_shutting_down: AtomicBool,
     pub health_last_ok: Mutex<Option<Instant>>,
     pub jit_warned: AtomicBool,
@@ -119,6 +126,14 @@ pub fn render(state: &State) -> String {
 fn render_reliability(state: &State, s: &mut String) {
     let uptime = state.started_at.elapsed();
     let _ = writeln!(s, "  current uptime:  {}", format_uptime(uptime));
+
+    // On clean shutdown we restore sysctl to this; expose it so the user
+    // can predict post-stop kernel state.
+    let restore = state
+        .original_cc_ipv4
+        .as_deref()
+        .unwrap_or("(not captured)");
+    let _ = writeln!(s, "  will restore to: {restore}");
 
     // Stats from the incident log.
     let (restarts, last_reason) = incident_history_summary();

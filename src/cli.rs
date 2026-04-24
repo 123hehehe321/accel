@@ -82,7 +82,7 @@ fn run_algo(args: &[String]) -> Result<()> {
 }
 
 fn run_server() -> Result<()> {
-    println!("hello accel (v0.2, 2.1-D5)");
+    println!("hello accel (v0.2, 2.1-D6)");
     println!();
 
     let cfg = config::load(Path::new(CONFIG_PATH))?;
@@ -135,6 +135,19 @@ fn run_server() -> Result<()> {
     let loaded = ebpf_loader::load_accel_cubic()?;
     println!("  registered as struct_ops: {}", loaded.name);
 
+    // Capture the kernel's CC algorithm BEFORE we overwrite it, so the
+    // clean-shutdown path can restore sysctl to pre-accel state (bug fix
+    // 2.1-D6: previously sysctl stayed pinned to accel_cubic after stop,
+    // keeping new connections routed through a doomed-to-unregister algo).
+    let original_cc_ipv4 = algo::current_cc_ipv4().ok();
+    let original_cc_ipv6 = algo::current_cc_ipv6();
+    if let Some(ref v4) = original_cc_ipv4 {
+        println!("  capturing pre-accel sysctl: {v4} (will restore on clean stop)");
+    } else {
+        eprintln!("warning: could not read current sysctl tcp_congestion_control;\
+                   clean shutdown will skip sysctl restore");
+    }
+
     // Apply sysctl so the kernel uses our algorithm for new connections.
     let target_name = cfg.algorithm.default.clone();
     algo::set_cc_both(&target_name).with_context(|| {
@@ -162,6 +175,8 @@ fn run_server() -> Result<()> {
         socket_path: socket_path.clone(),
         algo: Arc::new(Mutex::new(Some(loaded))),
         target_algo: Arc::new(Mutex::new(target_name)),
+        original_cc_ipv4,
+        original_cc_ipv6,
         health_shutting_down: AtomicBool::new(false),
         health_last_ok: Mutex::new(None),
         jit_warned: AtomicBool::new(false),
@@ -202,7 +217,33 @@ fn run_server() -> Result<()> {
 
     println!("shutting down...");
     // Stop the health thread before we tear down the algo it monitors.
+    // Otherwise health could race with our cleanup: detect our
+    // intentional sysctl restore as a "drift" and try to reconcile.
     state.health_shutting_down.store(true, Ordering::Relaxed);
+
+    // Restore sysctl to pre-accel value FIRST, before dropping the algo.
+    // Order matters:
+    //   1. sysctl restored → new TCP connections use the original CC,
+    //      NOT accel_cubic (which is about to be unregistered).
+    //   2. Link dropped → kernel unregisters accel_cubic from
+    //      tcp_available_congestion_control.
+    //   3. Skel dropped → map fds closed, kernel GCs the map once all
+    //      existing connections using accel_cubic release their refs.
+    // If we did 2 before 1, a new connection in the microsecond gap
+    // would try to look up accel_cubic right as it's disappearing.
+    if let Some(orig_v4) = state.original_cc_ipv4.as_deref() {
+        let orig_v6 = state.original_cc_ipv6.as_deref();
+        match algo::set_cc(orig_v4, orig_v6) {
+            Ok(()) => {
+                let v6_note = orig_v6
+                    .map(|v| format!(" / {v} (ipv6)"))
+                    .unwrap_or_default();
+                println!("sysctl restored: tcp_congestion_control={orig_v4}{v6_note}");
+            }
+            Err(e) => eprintln!("warning: could not restore sysctl to {orig_v4}: {e:#}"),
+        }
+    }
+
     // Explicitly drop the algo while state is reachable, so unregister-
     // related log lines land before socket removal.
     if let Some(algo) = state.algo.lock().ok().and_then(|mut g| g.take()) {
