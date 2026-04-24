@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use aya::maps::{MapData, PerCpuArray, PerCpuValues};
 use aya::programs::Xdp;
-use aya::util::online_cpus;
+use aya::util::nr_cpus;
 use aya::Ebpf;
 
 use crate::{config, mode, ports, socket, status};
@@ -104,16 +104,18 @@ fn run_server() -> Result<()> {
     let mut ebpf = Ebpf::load(&crate::CLASSIFIER_OBJ.0).context("failed to parse classifier.o")?;
 
     {
-        let nr_cpus = online_cpus()
-            .map_err(|(call, e)| anyhow!("failed to enumerate online CPUs via {call}: {e}"))?
-            .len();
+        // Per-CPU BPF maps are always sized by the kernel's NR_CPUS (possible
+        // cpus), not just the online count — cores that hotplug in later use
+        // the same pre-allocated slot. aya rejects vecs of the wrong length.
+        let possible_cpus = nr_cpus()
+            .map_err(|(call, e)| anyhow!("failed to read possible CPUs via {call}: {e}"))?;
         let mut port_map: PerCpuArray<_, u8> = PerCpuArray::try_from(
             ebpf.map_mut("port_map")
                 .ok_or_else(|| anyhow!("eBPF map 'port_map' not found"))?,
         )
         .context("'port_map' is not a PerCpuArray<u8>")?;
         for port in parsed_ports.iter_ports() {
-            let ones = PerCpuValues::try_from(vec![1u8; nr_cpus])
+            let ones = PerCpuValues::try_from(vec![1u8; possible_cpus])
                 .context("building PerCpuValues for port_map")?;
             port_map
                 .set(port as u32, ones, 0)
