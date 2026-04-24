@@ -74,14 +74,17 @@ accel 的核心工程承诺是**用户零改动**:
 
 ### 1.5 支持的系统
 
-- **Debian 11**:需升级到 backports 内核 (6.1+)
+accel 使用 eBPF struct_ops Link API,需要 **Linux 内核 6.4+**(Linux commit 68b04864,2023-03)。
+
+- **Debian 13**:默认内核即可(6.12+) ✅ 推荐
+- **Debian 12**:必须升级到 bookworm-backports 内核(6.7+,推荐 6.12)
   ```bash
-  sudo sh -c 'echo "deb http://deb.debian.org/debian bullseye-backports main" > /etc/apt/sources.list.d/backports.list'
+  sudo sh -c 'echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list'
   sudo apt update
-  sudo apt install -t bullseye-backports linux-image-amd64
+  sudo apt install -t bookworm-backports linux-image-amd64
   sudo reboot
   ```
-- **Debian 12 / 13**:默认内核即可(6.1+ / 6.12+)
+- **Debian 11**:**不推荐**。bullseye-backports 最高到 6.1,不支持 struct_ops Link 语义。建议升级到 Debian 12/13。
 - **架构**:x86_64(aarch64 理论支持,未验证)
 - **不支持 Debian 10**:内核太旧,不支持 struct_ops BPF
 
@@ -965,6 +968,7 @@ sudo ./accel
 |-----|-----|-----|
 | 0.1 | 2026-04 | 初版:AF_XDP + smoltcp 架构,第一步完成(eBPF 分流)|
 | 0.2 | 2026-04 | 架构重构:转向 eBPF struct_ops,放弃 AF_XDP + smoltcp |
+| 0.2.1 | 2026-04 | README §1.5 调整:明确 struct_ops.link 需内核 6.4+,Debian 12 必须 backports,Debian 11 不再支持 |
 
 ---
 
