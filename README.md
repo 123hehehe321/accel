@@ -792,6 +792,28 @@ sudo ./accel
 - **2.2 完成**:BBR 移植,**跨境场景开始有明显提升**
 - **第三步完成**:激进算法,**高丢包场景显著提升**
 
+### 12.5 关于 stop 后的 struct_ops 残留(内核正确行为)
+
+`./accel stop` 后用 `sudo bpftool struct_ops show` 可能仍看到 `accel_cubic`
+条目几秒到几分钟。**这不是 accel bug**,是 Linux 内核对 `.struct_ops.link`
+的保护机制:
+
+- accel 运行期间建立的 TCP 连接会选中 `accel_cubic` 作为 CC 算法,
+  该选择在连接的整个生命周期**固定不变**(不跟 sysctl 改动走)
+- 只要还有这类连接存活,kernel 保留 `accel_cubic` map
+  防止 use-after-free
+- 新建的 TCP 连接走已恢复的 sysctl(一般是 `bbr` / `cubic`)
+- 旧连接全部关闭后,kernel 自动 GC 掉 `accel_cubic` map,
+  `bpftool struct_ops show` 就看不到了
+
+查看当前还有哪些连接在 pin 着 `accel_cubic`:
+```bash
+sudo ss -tniO | grep accel_cubic
+```
+
+如果这条命令无输出但 `bpftool struct_ops show` 仍看到 `accel_cubic`,
+说明 kernel GC 还未及时 —— 再等 30 秒基本会消失。
+
 ---
 
 ## 13. 编码规范与工作指引

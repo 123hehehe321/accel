@@ -139,17 +139,28 @@ fn run_server() -> Result<()> {
     // clean-shutdown path can restore sysctl to pre-accel state (bug fix
     // 2.1-D6: previously sysctl stayed pinned to accel_cubic after stop,
     // keeping new connections routed through a doomed-to-unregister algo).
-    let original_cc_ipv4 = algo::current_cc_ipv4().ok();
-    let original_cc_ipv6 = algo::current_cc_ipv6();
-    if let Some(ref v4) = original_cc_ipv4 {
-        println!("  capturing pre-accel sysctl: {v4} (will restore on clean stop)");
-    } else {
-        eprintln!("warning: could not read current sysctl tcp_congestion_control;\
-                   clean shutdown will skip sysctl restore");
+    //
+    // Edge case: if the captured value IS the algorithm we're about to
+    // load (e.g. a prior accel run exited abnormally and left sysctl
+    // pointing at accel_cubic, which is then still in-kernel because
+    // lingering sockets held it), restoring to that same name at
+    // shutdown would fail — by then our Link has dropped and the algo
+    // is unregistered, so `sysctl -w = accel_cubic` gets EINVAL.
+    // We coerce such captures to a built-in fallback (bbr → cubic →
+    // reno, whichever is registered) at capture time, keeping the
+    // shutdown restore path trivial.
+    let target_name = cfg.algorithm.default.clone();
+    let original_cc_ipv4 = capture_cc_with_fallback(algo::current_cc_ipv4().ok(), &target_name);
+    let original_cc_ipv6 = capture_cc_with_fallback(algo::current_cc_ipv6(), &target_name);
+    match &original_cc_ipv4 {
+        Some(v4) => println!("  capturing pre-accel sysctl: {v4} (will restore on clean stop)"),
+        None => eprintln!(
+            "warning: could not read current sysctl tcp_congestion_control;\
+             clean shutdown will skip sysctl restore"
+        ),
     }
 
     // Apply sysctl so the kernel uses our algorithm for new connections.
-    let target_name = cfg.algorithm.default.clone();
     algo::set_cc_both(&target_name).with_context(|| {
         format!("setting sysctl tcp_congestion_control={target_name}")
     })?;
@@ -283,4 +294,28 @@ fn jit_enabled() -> bool {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .map(|v| v != 0)
         .unwrap_or(true)
+}
+
+/// If the captured sysctl value is the same algorithm we're about to
+/// load (rare edge case: previous accel run crashed and left sysctl
+/// pointing at accel_cubic), substitute a built-in fallback. Otherwise
+/// return the value unchanged. `None` in → `None` out.
+fn capture_cc_with_fallback(captured: Option<String>, target: &str) -> Option<String> {
+    let captured = captured?;
+    if captured != target {
+        return Some(captured);
+    }
+    // Pick the most preferred fallback that's currently registered.
+    // At startup (before we load target) every kernel built-in should be
+    // registered, so the first candidate usually wins.
+    for candidate in ["bbr", "cubic", "reno"] {
+        if algo::is_registered(candidate).unwrap_or(false) {
+            eprintln!(
+                "note: pre-accel sysctl was already {captured}; will restore to {candidate} on exit"
+            );
+            return Some(candidate.to_string());
+        }
+    }
+    // Last resort: cubic is always compiled into Linux.
+    Some("cubic".to_string())
 }
