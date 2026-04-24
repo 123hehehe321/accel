@@ -915,6 +915,61 @@ sudo ./accel
 - binaries 孤儿分支:编译好的二进制 + acc.conf.example + 简短下载说明
 - 每个阶段完成:main 合入 + binaries 分支更新 + 用户测试 → 再进下一阶段
 
+### 13.13 发布 binary 的构建方法
+
+binaries 分支的二进制在 **Ubuntu 22.04 Docker 容器**内编译,动态链接
+glibc 2.34 底层。在所有支持的目标平台(Debian 12 + backports、
+Debian 13)上天然兼容 —— glibc 向前兼容,2.34 基线覆盖远超 2.36。
+
+**为什么不走 musl 静态链接**:libbpf-sys 不 vendor libelf,musl 交叉
+编译需要从源码编静态 libelf,鼠洞太深(见 commit `2eab7c4` WIP 记录)。
+glibc 动态链接在一个足够旧的 base 镜像里编译是 libbpf-rs 生态的标准
+分发方式。
+
+**为什么用 Ubuntu 22.04 而不是 Debian 12**:Ubuntu 22.04 ships
+glibc 2.35 (Debian 12 是 2.36)。用更老的 base 编,兼容范围更宽。
+
+#### 构建命令
+
+前置:dev 机器已经装过 Rust toolchain (`~/.rustup/`、`~/.cargo/`)。
+
+```bash
+# 清掉宿主 target 避免污染
+rm -rf target
+
+# 容器内构建:挂宿主 Rust toolchain + 项目目录
+docker run --rm \
+  -v "$PWD:/work" \
+  -v "$HOME/.cargo:/root/.cargo" \
+  -v "$HOME/.rustup:/root/.rustup:ro" \
+  -e CARGO_HOME=/root/.cargo \
+  -e RUSTUP_HOME=/root/.rustup \
+  -e PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  -w /work \
+  ubuntu:22.04 \
+  bash -c "set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq build-essential clang libelf-dev llvm pkg-config
+    cargo build --release
+  "
+```
+
+产物:`target/release/accel`
+
+#### 产物验证
+
+```bash
+file target/release/accel
+#  ELF 64-bit LSB pie executable, dynamically linked, stripped
+
+ldd target/release/accel
+#  libelf.so.1, libz.so.1, libgcc_s.so.1, libc.so.6, libzstd.so.1
+
+objdump -T target/release/accel | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1
+#  GLIBC_2.34   ← 必须 ≤ 2.36 才覆盖 Debian 12
+```
+
 ---
 
 ## 附录 A:验收清单
