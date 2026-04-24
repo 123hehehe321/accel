@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod ebpf_loader;
 mod socket;
 mod status;
 

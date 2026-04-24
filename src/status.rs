@@ -33,9 +33,9 @@ pub fn render(state: &State) -> String {
     let _ = writeln!(s, "  socket:      {}", state.socket_path.display());
     let _ = writeln!(s);
     let _ = writeln!(s, "algorithm:");
-    let _ = writeln!(s, "  loaded:      none (migration in progress, 2.1-D2 checkpoint)");
+    let _ = writeln!(s, "  loaded:      none (migration in progress, 2.1-D3 checkpoint)");
     let _ = writeln!(s, "  active:      {kernel_cc} (kernel default)");
-    let _ = writeln!(s, "  note:        accel framework ready, algorithm will load in 2.1-D4");
+    let _ = writeln!(s, "  note:        skeleton embedded; runtime load lands in 2.1-D4");
     let _ = writeln!(s);
     if cpu_pct >= 0.0 {
         let _ = writeln!(s, "  cpu:         {cpu_pct:.1}%");

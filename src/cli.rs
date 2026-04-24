@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use crate::{config, socket, status};
+use crate::{config, ebpf_loader, socket, status};
 
 const CONFIG_PATH: &str = "./acc.conf";
 
@@ -59,7 +59,7 @@ fn run_stop() -> Result<()> {
 }
 
 fn run_server() -> Result<()> {
-    println!("hello accel (v0.2, 2.1-D2 migration checkpoint)");
+    println!("hello accel (v0.2, 2.1-D3 migration checkpoint)");
     println!();
 
     let cfg = config::load(Path::new(CONFIG_PATH))?;
@@ -77,8 +77,9 @@ fn run_server() -> Result<()> {
     println!("    socket   = {socket_display}");
     println!();
 
-    println!("⚠️  2.1-D2 checkpoint: no algorithm loaded yet.");
-    println!("   Framework ready; algorithm loading lands in 2.1-D4.");
+    println!("{}", ebpf_loader::skeleton_info());
+    println!();
+    println!("⚠️  2.1-D3 checkpoint: skeleton embedded, loading lands in 2.1-D4.");
     println!();
 
     // Resolve socket path and verify no other instance.

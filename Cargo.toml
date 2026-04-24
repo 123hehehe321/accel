@@ -4,7 +4,6 @@
 # 不再拦截流量、不再走 AF_XDP/smoltcp 用户态栈。
 #
 # 精确版本 pin (= 前缀):防止 cargo update 引入非预期变化。
-# 2.1-D3 会加入 libbpf-rs / libbpf-cargo / vmlinux。
 
 [package]
 name = "accel"
@@ -30,13 +29,18 @@ libc = "0.2"
 # SIGINT / SIGTERM 处理
 ctrlc = { version = "=3.5.2", features = ["termination"] }
 
-# ──────────────────────────────────────────────────────────
-# 2.1-D3 会加入的依赖(现在不加):
-#   libbpf-rs = "=0.26.2"
-#   [build-dependencies]
-#   libbpf-cargo = "=0.26.2"
-#   vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git",
-#              rev = "991dd4b8dfd8c9d62ce8999521b24f61d9b7fc52" }
+# eBPF runtime loader (used from 2.1-D4 onwards).
+libbpf-rs = "=0.26.2"
+
+[build-dependencies]
+# SkeletonBuilder in build.rs compiles ebpf/algorithms/*.bpf.c and emits
+# <name>.skel.rs into OUT_DIR.
+libbpf-cargo = "=0.26.2"
+
+# Pre-generated vmlinux.h for multiple arches.  Not published to crates.io;
+# pinned to the same commit hash used by libbpf-rs examples/tcp_ca so we
+# inherit their compatibility matrix.
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "991dd4b8dfd8c9d62ce8999521b24f61d9b7fc52" }
 
 # ──────────────────────────────────────────────────────────
 # 构建配置
