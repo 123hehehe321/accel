@@ -3,47 +3,22 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use aya::maps::{MapData, PerCpuArray};
-
-use crate::mode::ResolvedMode;
-
 /// Shared state published to the socket server for status requests.
-/// All fields here are cheap to access; fields that can change at runtime
-/// (iface_state, jit, cpu/mem, stats) are re-read fresh on every status call
-/// inside `render()`.
+///
+/// Day 2 carries only the truly invariant fields. The algorithm / health
+/// related fields land here in Day 4 as the real struct_ops loading goes in.
 pub struct State {
     pub pid: u32,
     pub started_at: Instant,
-    pub iface: String,
-    pub iface_driver: Option<String>,
-    pub ports: String,
-    pub mode: ResolvedMode,
     pub socket_path: PathBuf,
-    pub stats: PerCpuArray<MapData, u64>,
 }
 
 pub fn render(state: &State) -> String {
     let uptime = state.started_at.elapsed();
-    let iface_state = read_iface_state(&state.iface);
-    let jit = read_jit_state();
     let cpu_pct = read_cpu_pct(uptime).unwrap_or(-1.0);
     let mem_mb = read_rss_mb().unwrap_or(0);
+    let kernel_cc = read_kernel_cc().unwrap_or_else(|| "?".into());
 
-    let (accel, pass) = match (
-        state.stats.get(&0, 0).map(|v| v.iter().sum::<u64>()),
-        state.stats.get(&1, 0).map(|v| v.iter().sum::<u64>()),
-    ) {
-        (Ok(a), Ok(p)) => (a, p),
-        _ => (0, 0),
-    };
-    let total = accel + pass;
-    let ratio = if total > 0 {
-        accel as f64 * 100.0 / total as f64
-    } else {
-        0.0
-    };
-
-    let driver = state.iface_driver.as_deref().unwrap_or("?");
     let version = concat!(
         env!("CARGO_PKG_VERSION_MAJOR"),
         ".",
@@ -55,13 +30,12 @@ pub fn render(state: &State) -> String {
     let _ = writeln!(s, "  version:     {version}");
     let _ = writeln!(s, "  running:     yes (pid={})", state.pid);
     let _ = writeln!(s, "  uptime:      {}", format_uptime(uptime));
-    let _ = writeln!(s);
-    let _ = writeln!(s, "  iface:       {} ({driver})", state.iface);
-    let _ = writeln!(s, "  iface_state: {iface_state}");
-    let _ = writeln!(s, "  mode:        {}", state.mode);
-    let _ = writeln!(s, "  jit:         {jit}");
-    let _ = writeln!(s, "  ports:       {}", state.ports);
     let _ = writeln!(s, "  socket:      {}", state.socket_path.display());
+    let _ = writeln!(s);
+    let _ = writeln!(s, "algorithm:");
+    let _ = writeln!(s, "  loaded:      none (migration in progress, 2.1-D2 checkpoint)");
+    let _ = writeln!(s, "  active:      {kernel_cc} (kernel default)");
+    let _ = writeln!(s, "  note:        accel framework ready, algorithm will load in 2.1-D4");
     let _ = writeln!(s);
     if cpu_pct >= 0.0 {
         let _ = writeln!(s, "  cpu:         {cpu_pct:.1}%");
@@ -69,33 +43,7 @@ pub fn render(state: &State) -> String {
         let _ = writeln!(s, "  cpu:         ?");
     }
     let _ = writeln!(s, "  mem:         {mem_mb} MB");
-    let _ = writeln!(s);
-    let _ = writeln!(s, "  stats:");
-    let _ = writeln!(s, "    pkt_total:    {:>15}", thousands(total));
-    let _ = writeln!(s, "    pkt_accel:    {:>15}", thousands(accel));
-    let _ = writeln!(s, "    accel_ratio:  {:>14.1}%", ratio);
     s
-}
-
-pub fn read_iface_driver(iface: &str) -> Option<String> {
-    let link = fs::read_link(format!("/sys/class/net/{iface}/device/driver")).ok()?;
-    link.file_name()?.to_str().map(|s| s.to_string())
-}
-
-fn read_iface_state(iface: &str) -> String {
-    fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "?".to_string())
-}
-
-fn read_jit_state() -> &'static str {
-    match fs::read_to_string("/proc/sys/net/core/bpf_jit_enable") {
-        Ok(v) => match v.trim().parse::<u32>().unwrap_or(0) {
-            0 => "disabled",
-            _ => "enabled",
-        },
-        Err(_) => "?",
-    }
 }
 
 fn read_rss_mb() -> Option<u64> {
@@ -107,6 +55,12 @@ fn read_rss_mb() -> Option<u64> {
         }
     }
     None
+}
+
+fn read_kernel_cc() -> Option<String> {
+    fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control")
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Cumulative CPU% since process start. One-shot read, no sampling thread.
@@ -145,31 +99,9 @@ fn format_uptime(d: Duration) -> String {
     }
 }
 
-fn thousands(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn thousands_basic() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(12), "12");
-        assert_eq!(thousands(1234), "1,234");
-        assert_eq!(thousands(1234567), "1,234,567");
-        assert_eq!(thousands(1000), "1,000");
-    }
 
     #[test]
     fn uptime_formats() {

@@ -6,37 +6,21 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub network: Network,
+    pub algorithm: Algorithm,
     pub runtime: Runtime,
-    pub forward: Forward,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Network {
-    pub interface: String,
-    pub ports: String,
-    pub mode: Mode,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Auto,
-    Native,
-    Generic,
+pub struct Algorithm {
+    pub default: String,
+    pub algo_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
     pub socket: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Forward {
-    pub backend: String,
 }
 
 pub fn load(path: &Path) -> Result<Config> {
