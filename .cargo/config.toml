@@ -5,6 +5,13 @@
 # linux-libc-dev package (they live under /usr/include/x86_64-linux-gnu/).
 # Point the C compiler there so <asm/unistd.h> / <asm/types.h> resolve.
 #
-# uapi headers are libc-agnostic by design, so using glibc's multiarch
-# copy to compile a musl target is the standard Debian/Ubuntu fix.
-CFLAGS_x86_64_unknown_linux_musl = "-I/usr/include/x86_64-linux-gnu"
+# We use -idirafter (not -I) so the path is consulted LAST, after musl's
+# own includes. Using -I here prepends the dir and lets glibc's bits/*
+# internals shadow musl's (struct flock redefinition, missing
+# linux/errno.h). With -idirafter, musl's own headers win every normal
+# include; only uapi headers that musl doesn't ship (asm/*.h) fall
+# through to the multiarch glibc dir.
+#
+# uapi headers are libc-agnostic by design, so reusing glibc's multiarch
+# copy to build a musl target is the standard Debian/Ubuntu fix.
+CFLAGS_x86_64_unknown_linux_musl = "-idirafter /usr/include/x86_64-linux-gnu"
