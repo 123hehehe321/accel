@@ -1,34 +1,43 @@
 # ═══════════════════════════════════════════════════════════
-#  accel TCP 加速器配置文件
-#  版本: 0.2
+#  accel TCP 加速器配置示例
+#  从 binaries 分支下载二进制后,把这个文件改名为 acc.conf
 #
-#  架构:eBPF struct_ops 替换内核 TCP 拥塞控制算法。
-#  accel 不拦截流量、不代理、不改包,只是换了"发包决策者"。
+#  从 2.1/2.2 旧格式迁移:
+#    旧:                          新:
+#      [algorithm]                  algorithm = "accel_cubic"
+#      default = "accel_cubic"
+#      algo_dir = "./algorithms"
+#                                   [runtime]
+#      [runtime]                    socket = ""
+#      socket = ""
 #
-#  这个文件必须和 accel 二进制在同一目录。
-#  修改配置后需要重启 accel 才生效:
-#    ./accel stop
-#    vim acc.conf
-#    sudo ./accel
+#    顶层 algorithm 字段替换 [algorithm].default;
+#    [algorithm] 段整段删除 (algo_dir 字段不再使用);
+#    [runtime] 段保留不变。
 # ═══════════════════════════════════════════════════════════
 
 
-[algorithm]
-# 默认使用的算法
-# 可选值(按当前阶段可用性):
-#   accel_cubic   [2.1 起可用,稳定基线]
-#   accel_bbr     [2.2 起可用,推荐生产用]
-#   accel_brutal  [第三步起可用,高丢包跨境场景]
-default = "accel_cubic"
-
-# 算法 .bpf.o 文件所在目录
-# 相对路径从二进制目录算起,或绝对路径
-algo_dir = "./algorithms"
+# ─── 必填: 选用的算法 ────────────────────────────────────────
+# 可选值:
+#   accel_cubic   稳定基线 (BPF CUBIC 移植)
+#   accel_brutal  跨境高丢包场景的激进算法 (需要 [brutal] 段)
+#
+# 启动时算法加载失败 → 程序退出 (不静默降级)。
+algorithm = "accel_cubic"
 
 
+# ─── 仅当 algorithm = "accel_brutal" 时必填 ─────────────────
+# 单 TCP 连接速率上限,Mbps (megabit per second)。
+# 例: 100 Mbps 链路设 100,千兆链路设 1000。
+# 范围: 1..=100000 (100 Gbps)。
+#
+# 选 brutal 时取消下面两行的注释:
+#[brutal]
+#rate_mbps = 100
+
+
+# ─── runtime ─────────────────────────────────────────────────
 [runtime]
-# Unix Socket 路径
-# 空字符串 = 智能决策:
-#   - 被 systemd 启动  → /run/accel/accel.sock
-#   - 手动启动(开发)   → ./accel.sock
+# Unix Socket 路径,空 = 自动决策 (systemd → /run/accel/accel.sock,
+# 手动 → ./accel.sock)。
 socket = ""
