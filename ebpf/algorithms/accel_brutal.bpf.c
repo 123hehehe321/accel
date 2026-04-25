@@ -192,19 +192,31 @@ void BPF_PROG(brutal_init, struct sock *sk)
 	/* (2) No slow-start: brutal trusts the configured rate. */
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
-	/* (3) Plan-A pacing enable.
+	/* (3) Pacing enable — Plan B: removed direct write of
+	 * SK_PACING_NEEDED here.
 	 *
-	 * Original tcp-brutal uses cmpxchg here for thread safety against
-	 * other code paths flipping pacing_status concurrently:
+	 * Original tcp-brutal uses cmpxchg here for thread safety:
 	 *   cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 	 *
-	 * In BPF struct_ops context (softirq, single path per socket
-	 * connect), there's no concurrent writer to race against, so a
-	 * direct write is equivalent and verifier-friendly. If the
-	 * verifier rejects this write we fall back to omitting it — the
-	 * kernel already promotes pacing_status to NEEDED on first packet
-	 * for cong_control-style algorithms in recent kernels. */
-	sk->sk_pacing_status = SK_PACING_NEEDED;
+	 * Plan A (direct write `sk->sk_pacing_status = SK_PACING_NEEDED;`)
+	 * passed the verifier on v6.12, but runtime diagnostics on user VPS
+	 * showed init was being silently truncated past this write —
+	 * brutal_init run_cnt=24 yet brutal_socket_count stayed at 0 across
+	 * 3 active accel_brutal connections. Hypothesis: v6.12 struct_ops
+	 * runtime aborts the remainder of init when the direct sk_pacing_status
+	 * write hits a kernel-side safety check that verifier static
+	 * analysis didn't catch.
+	 *
+	 * Plan B: omit the write entirely. The kernel auto-promotes
+	 * pacing_status to SK_PACING_NEEDED the first time a cong_control
+	 * algorithm sets sk_pacing_rate — which brutal_update_rate does
+	 * on every ACK (see line setting sk->sk_pacing_rate below). So
+	 * functional pacing is unaffected.
+	 *
+	 * If user VPS testing shows pacing not actually engaged after this
+	 * change, escalate to Plan C (bpf_setsockopt with TCP_PACING_RATE
+	 * or equivalent).
+	 */
 
 	/* (4) Bump the global brutal-socket counter. ARRAY map key 0 is
 	 * always present so the lookup should never fail; even so, do not
