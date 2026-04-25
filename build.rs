@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use libbpf_cargo::SkeletonBuilder;
 
-const ALGORITHMS: &[&str] = &["accel_cubic", "accel_bbr"];
+const ALGORITHMS: &[&str] = &["accel_cubic", "accel_brutal"];
 
 fn main() {
     let out_dir = PathBuf::from(

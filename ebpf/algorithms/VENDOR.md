@@ -65,87 +65,85 @@ When a new Linux release is pinned:
 4. Run `cargo build` and the 2.1 verification suite.
 
 
-## accel_bbr.bpf.c
+## accel_brutal.bpf.c
 
-- **Source path**: `net/ipv4/tcp_bbr.c`
-- **Source repo**: https://github.com/torvalds/linux
-- **Git tag**: `v6.12`
-- **Commit SHA**: `adc218676eef25575469234709c2d87185ca223a`
-- **Raw URL**: https://raw.githubusercontent.com/torvalds/linux/v6.12/net/ipv4/tcp_bbr.c
-- **Copied on**: 2026-04-24
+**Status**: ⚠️ **Not vendored** — there is no upstream tcp-brutal in
+Linux. This is a **fresh BPF struct_ops implementation inspired by**
+[apernet/tcp-brutal](https://github.com/apernet/tcp-brutal) (kernel
+module, GPL-2.0). Algorithm semantics faithfully reproduced; userspace
+plumbing replaced with the accel BPF-map global-config style.
 
-### Why this port is heavier than accel_cubic
+- **Reference repo**: https://github.com/apernet/tcp-brutal
+- **Reference file**: `brutal.c` (316 lines)
+- **Reference version**: tcp-brutal v1.0.2 (master at 2026-04)
+- **Wrote on**: 2026-04-25
 
-`bpf_cubic.c` lived under `tools/testing/selftests/bpf/progs/` and was
-already written in BPF style (`SEC()` decorators, `BPF_PROG()` macro,
-`.struct_ops` section). `tcp_bbr.c` is a plain in-tree kernel module and
-has to be **converted** to BPF struct_ops form: strip module
-registration, decorate callback functions, inline kernel-only helpers.
+### Why "inspired by" vs "vendored from"
 
-### Local modifications (mechanical, done at vendor time)
+The algorithm core is small and its public API (per-socket setsockopt
+via `TCP_BRUTAL_PARAMS`) doesn't fit the BPF struct_ops model — struct_ops
+can't override `sk->sk_prot.setsockopt`. Instead of mechanically
+transforming kernel-module C and then unwinding the parts that don't
+fit, we wrote a clean BPF version from scratch using upstream as the
+algorithm specification.
 
-1. **Header banner** — vendor source comment + pointer to this file.
-2. **Removed** kernel-module machinery:
-   - `#include <linux/module.h>`, `<linux/btf.h>`, `<linux/inet_diag.h>`, …
-   - `BTF_KFUNCS_START` … `BTF_KFUNCS_END` block
-   - `static int __init bbr_register()` / `bbr_unregister()` / `module_init` / `module_exit`
-   - `MODULE_AUTHOR` / `MODULE_LICENSE` / `MODULE_DESCRIPTION`
-3. **Replaced** kernel headers with the BPF-side equivalents:
-   - `#include "vmlinux.h"`, `<bpf/bpf_helpers.h>`, `<bpf/bpf_tracing.h>`,
-     `<bpf/bpf_core_read.h>`.
-4. **Inlined** the six socket helpers reused from accel_cubic
-   (`tcp_jiffies32`, `inet_csk`, `inet_csk_ca`, `tcp_sk`) plus
-   `tcp_snd_cwnd`.
-5. **Inlined** three `<linux/win_minmax.h>` helpers BBR needs
-   (`minmax_get`, `minmax_reset`, `minmax_running_max` and their
-   internal `minmax_subwin_update`). Bodies copied verbatim.
-6. **Callback decoration**: every function originally marked
-   `__bpf_kfunc static RET name(ARGS)` is rewritten as
-   `SEC("struct_ops") RET BPF_PROG(name, ARGS)`. These are the 8 entry
-   points that struct_ops binds to: `bbr_init`, `bbr_main`,
-   `bbr_sndbuf_expand`, `bbr_undo_cwnd`, `bbr_cwnd_event`,
-   `bbr_ssthresh`, `bbr_min_tso_segs`, `bbr_set_state`.
-7. **Dropped** `bbr_get_info`: it's a debugging callback that fills a
-   userspace-visible `union tcp_cc_info`. Not `__bpf_kfunc` upstream,
-   and BPF struct_ops doesn't support it cleanly. Not critical —
-   `ss -ti` still works via kernel-generic TCP_INFO.
-8. **Replaced** the upstream `static struct tcp_congestion_ops
-   tcp_bbr_cong_ops` definition with
-   `SEC(".struct_ops.link") struct tcp_congestion_ops accel_bbr`
-   (same `.link` semantics as accel_cubic for clean drop-via-Link).
-   Set `.name = "accel_bbr"`. Dropped `.flags`, `.owner`, `.get_info`
-   fields (kernel-only or not ported).
+### Faithful to upstream
 
-### Known unresolved at 2.2-D1 (to address in 2.2-D2 verifier爬坑)
+- The 5-second packet-info window aggregation
+- `MIN_PKT_INFO_SAMPLES = 50` threshold below which `ack_rate = 100`
+- **`MIN_ACK_RATE_PERCENT = 80` floor on `ack_rate` — the soul of brutal**
+- `INIT_CWND_GAIN = 20` (= 2.0×) cwnd multiplier
+- `MIN_CWND = 4` cwnd floor
+- `TCP_INFINITE_SSTHRESH` — no slow start
+- `undo_cwnd` returns current `snd_cwnd` unchanged ("never retreat")
+- cwnd computation order chosen to avoid intermediate u64 overflow
+  (per upstream comment at brutal.c:220)
 
-The above is mechanical and gets us past the BPF *section* structure,
-but the BBR body still references kernel-only helpers that may need
-BPF-friendly replacements:
-- `READ_ONCE` / `WRITE_ONCE` (6 call sites) — likely stripped to plain reads/writes.
-- `do_div` / `div_u64` (3 call sites) — BPF supports u64 division natively.
-- `get_random_u32()` (1 call site) — replace with `bpf_get_prandom_u32()`.
-- `msecs_to_jiffies()` (1 call site) — convert inline.
-- `__read_mostly` — BPF ignores / no-op.
-- `sock_owned_by_me` / similar sanity asserts — likely strip.
+### Deliberately changed for accel architecture
 
-D2 handles these as verifier & clang errors surface. The list above is
-a starting hypothesis, not a fix plan.
+1. **Per-socket setsockopt → global BPF map**. Upstream lets each
+   application pick its own bandwidth via `setsockopt(TCP_BRUTAL_PARAMS)`.
+   accel exposes one knob (`acc.conf [brutal].rate_mbps`) shared by all
+   `accel_brutal` sockets on the host. Per-socket variation can be added
+   later if needed; documented as a known limitation in README §12.6.
+2. **`cwnd_gain` no longer per-socket**. Upstream lets userspace tune
+   it via the same `setsockopt`. accel hardcodes `INIT_CWND_GAIN = 20`
+   based on tcp-brutal's recommended default. Not exposed to users.
+3. **`cmpxchg(sk->sk_pacing_status, NONE, NEEDED)` → direct write**.
+   Same observable effect; verifier-friendlier; safe because BPF
+   struct_ops `init` runs in softirq with no concurrent writer for the
+   per-socket data. Comment in code explains the reasoning so future
+   maintainers don't worry about it.
+4. **Added `release` callback**. Upstream has none. accel uses it to
+   decrement the global socket-count map (informational, not algorithm).
+5. **Underflow-guarded `release`**. Non-atomic `if (*cnt > 0)` before
+   `__sync_fetch_and_sub` may race in extreme close storms but trades a
+   transient off-by-one for not wrapping u64. Acceptable per design
+   ("simple is method") — full atomicity would need a CAS loop the
+   verifier may reject.
+6. **`PKT_INFO_SLOTS = 5` hardcoded**. Upstream computes it dynamically
+   from `ICSK_CA_PRIV_SIZE`, clamped to [3, 5]. We pick the upper bound
+   and `_Static_assert` the resulting struct fits.
 
-### Unchanged
+### Local symbol layout
 
-- **Algorithm logic** — every bbr_* function body is byte-for-byte
-  upstream. No BBR decision changed.
-- **Internal symbol names** — all `bbr_*` function and data symbols
-  kept so future `diff` against upstream stays readable.
-- **SPDX line** — upstream `GPL-2.0` preserved.
+- File header: SPDX, vendor note pointing here.
+- Constants: `INIT_CWND_GAIN` etc., 1:1 from upstream.
+- 6 inlined kernel helpers: `min_t`, `max_t`, `inet_csk`, `inet_csk_ca`,
+  `tcp_sk`, plus `_Static_assert`.
+- 2 BPF maps: `brutal_rate_config`, `brutal_socket_count`.
+- 5 struct_ops callbacks: `brutal_init`, `brutal_release`, `brutal_main`,
+  `brutal_undo_cwnd`, `brutal_ssthresh`.
+- 1 internal helper: `brutal_update_rate` (1:1 port of upstream).
+- Final `SEC(".struct_ops.link") struct tcp_congestion_ops accel_brutal`.
 
 ### Upgrade procedure
 
-When a new Linux release is pinned:
+When tcp-brutal upstream changes its algorithm:
 
-1. `curl -fsSL https://raw.githubusercontent.com/torvalds/linux/<tag>/net/ipv4/tcp_bbr.c -o /tmp/tcp_bbr.c`
-2. Run `/tmp/2.2-d1/port.py` equivalent (or re-apply the mechanical
-   transforms listed above).
-3. Rebuild, re-verify on a kernel-6.4+ host.
-4. Update this file with the new tag + commit SHA + note any new
-   upstream struct_ops callbacks that appeared.
+1. `curl -fsSL https://raw.githubusercontent.com/apernet/tcp-brutal/<commit>/brutal.c -o /tmp/brutal.c`
+2. Diff the algorithm core (`brutal_init`, `brutal_main`, `brutal_update_rate`)
+   against `accel_brutal.bpf.c`.
+3. Apply changes by hand, preserving the 6 deliberate divergences listed
+   above. Do **not** auto-port — the userspace plumbing differs.
+4. Update this section with the new reference commit and date.
