@@ -245,8 +245,12 @@ __u32 BPF_PROG(brutal_main, struct sock *sk, __u32 ack, int flag,
 
 	__u64 sec = tp->tcp_mstamp / USEC_PER_SEC;
 	__u32 slot = sec % PKT_INFO_SLOTS;
-	/* Explicit bound — verifier loses the modulo's upper-bound across the
-	 * u64→u32 cast and rejects the array math otherwise. */
+	/* Force verifier to re-track slot's range from this point. The
+	 * explicit if below would suffice on most kernels, but v6.12's
+	 * verifier loses the modulo's upper bound across the u64→u32 cast
+	 * and rejects the array math otherwise. barrier_var() is the BPF
+	 * community's standard fix for this class of cast-bound loss. */
+	barrier_var(slot);
 	if (slot >= PKT_INFO_SLOTS)
 		return 0;
 	struct brutal_pkt_info *pkt = &b->slots[slot];
