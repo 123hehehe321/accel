@@ -11,6 +11,9 @@
 
 **验收**: 7 场景 VPS 实测全 PASS (verify-2.3.sh A/B/C/D/E/F/G)。
 
+> 📖 **新会话开始前请先读** [PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md)
+> 包含核心原则、工作模式、工程教训、已知特征等关键上下文。
+
 ---
 
 ## 目录
