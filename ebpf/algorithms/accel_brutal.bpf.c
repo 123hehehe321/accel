@@ -229,33 +229,40 @@ void BPF_PROG(brutal_release, struct sock *sk)
 		__sync_fetch_and_sub(cnt, 1);
 }
 
+/* cong_control callback. BPF struct_ops verifier requires global functions
+ * to return a scalar even though the kernel signature is void; we return 0
+ * unconditionally and the kernel ignores it. */
 SEC("struct_ops")
-void BPF_PROG(brutal_main, struct sock *sk, __u32 ack, int flag,
-	      const struct rate_sample *rs)
+__u32 BPF_PROG(brutal_main, struct sock *sk, __u32 ack, int flag,
+	       const struct rate_sample *rs)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct brutal_priv *b = inet_csk_ca(sk);
 
 	/* Drop invalid samples (warming up, retransmits without delivery). */
 	if (rs->delivered < 0 || rs->interval_us <= 0)
-		return;
+		return 0;
 
 	__u64 sec = tp->tcp_mstamp / USEC_PER_SEC;
 	__u32 slot = sec % PKT_INFO_SLOTS;
+	/* Explicit bound — verifier loses the modulo's upper-bound across the
+	 * u64→u32 cast and rejects the array math otherwise. */
 	if (slot >= PKT_INFO_SLOTS)
-		return; /* defensive — verifier may demand explicit bound */
+		return 0;
+	struct brutal_pkt_info *pkt = &b->slots[slot];
 
-	if (b->slots[slot].sec == sec) {
-		b->slots[slot].acked  += rs->acked_sacked;
-		b->slots[slot].losses += rs->losses;
+	if (pkt->sec == sec) {
+		pkt->acked  += rs->acked_sacked;
+		pkt->losses += rs->losses;
 	} else {
 		/* Slot is stale (different second hashed here); overwrite. */
-		b->slots[slot].sec    = sec;
-		b->slots[slot].acked  = rs->acked_sacked;
-		b->slots[slot].losses = rs->losses;
+		pkt->sec    = sec;
+		pkt->acked  = rs->acked_sacked;
+		pkt->losses = rs->losses;
 	}
 
 	brutal_update_rate(sk);
+	return 0;
 }
 
 SEC("struct_ops")
