@@ -138,21 +138,33 @@ fn render_algo_list(state: &State) -> String {
         .unwrap_or_else(|_| "?".to_string());
     let active_v4 = algo::current_cc_ipv4().unwrap_or_else(|_| "?".to_string());
     let loaded = state
-        .algo
+        .algos
         .lock()
         .ok()
-        .and_then(|g| g.as_ref().map(|a| a.name.to_string()))
-        .unwrap_or_else(|| "none".to_string());
+        .map(|g| {
+            let mut names: Vec<String> = g.keys().cloned().collect();
+            names.sort();
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        })
+        .unwrap_or_else(|| "?".to_string());
     format!(
-        "available: {available}\n\
-         loaded by accel: {loaded}\n\
-         target:    {target}\n\
-         active:    {active_v4} (ipv4)\n"
+        "loaded by accel:    {loaded}\n\
+         target:             {target}\n\
+         active (ipv4):      {active_v4}\n\
+         available (kernel): {available}\n"
     )
 }
 
-/// Set sysctl to `name` and update the daemon's target so health.rs
-/// (2.1-D5) keeps it locked in.
+/// Algo switch is now a pure sysctl write. Allowed targets are either
+/// an algorithm accel itself loaded (members of `state.algos`) or any
+/// kernel built-in present in `tcp_available_congestion_control`.
+/// `algo::set_cc_both` already validates name is registered, so this
+/// function just forwards plus updates the daemon's `target_algo` so
+/// health.rs sysctl-drift detection keeps it locked in.
 fn handle_algo_switch(name: &str, state: &State) -> Result<()> {
     if name.is_empty() {
         bail!("missing algorithm name (usage: algo_switch NAME)");

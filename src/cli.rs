@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::process::{Command, ExitCode};
@@ -7,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
+use crate::ebpf_loader::LoadedAlgo;
 use crate::incidents::{self, Event};
 use crate::{algo, config, ebpf_loader, health, socket, status};
 
@@ -82,26 +84,27 @@ fn run_algo(args: &[String]) -> Result<()> {
 }
 
 fn run_server() -> Result<()> {
-    println!("hello accel (v0.2, 2.1-D6)");
+    println!("hello accel (v0.2, 2.3-D3)");
     println!();
 
     let cfg = config::load(Path::new(CONFIG_PATH))?;
 
     println!("config loaded from: {CONFIG_PATH}");
-    println!("  [algorithm]");
-    println!("    default  = {:?}", cfg.algorithm.default);
-    println!("    algo_dir = {:?}", cfg.algorithm.algo_dir);
+    println!("  algorithm = {:?}", cfg.algorithm);
+    if let Some(b) = &cfg.brutal {
+        println!("  [brutal]");
+        println!("    rate_mbps = {}", b.rate_mbps);
+    }
     println!("  [runtime]");
     let socket_display = if cfg.runtime.socket.is_empty() {
         "\"\" (auto-detect)".to_string()
     } else {
         format!("{:?}", cfg.runtime.socket)
     };
-    println!("    socket   = {socket_display}");
+    println!("    socket    = {socket_display}");
     println!();
 
-    // Incident log initialization and startup record, *before* any side
-    // effect so the startup row always makes it to disk.
+    // Incident log + startup record before any kernel side-effect.
     incidents::init(incidents::resolve_path());
     let kernel = incidents::read_kernel_release();
     let last_shutdown = incidents::last_shutdown_reason();
@@ -115,7 +118,6 @@ fn run_server() -> Result<()> {
     println!("  kernel:        {kernel}");
     println!("  last shutdown: {last_shutdown}");
 
-    // Startup-time health probes that only fire once per process.
     if let Some(prev) = scan_dmesg_oom() {
         let _ = incidents::append(Event::OomKilled {
             previous_pid: Some(prev),
@@ -129,29 +131,70 @@ fn run_server() -> Result<()> {
 
     println!("{}", ebpf_loader::skeleton_info());
 
-    // Load + register the struct_ops algorithm BEFORE binding the socket,
-    // so a kernel-too-old failure doesn't leave an orphan socket file.
-    println!("loading accel_cubic into kernel...");
-    let loaded = ebpf_loader::load_accel_cubic()?;
-    println!("  registered as struct_ops: {}", loaded.name);
+    // Load every algorithm we can. Individual failures are warnings, not
+    // fatal — only the user-chosen `cfg.algorithm` is required to load.
+    println!("loading algorithms into kernel...");
+    let mut loaded_algos = ebpf_loader::load_all();
+    if loaded_algos.is_empty() {
+        bail!(
+            "no algorithms loaded — check `dmesg | tail` for verifier errors. \
+             struct_ops.link requires Linux 6.4+ with CONFIG_DEBUG_INFO_BTF=y."
+        );
+    }
+    let mut names: Vec<&str> = loaded_algos.keys().map(String::as_str).collect();
+    names.sort();
+    println!("  loaded: {}", names.join(", "));
 
-    // Capture the kernel's CC algorithm BEFORE we overwrite it, so the
-    // clean-shutdown path can restore sysctl to pre-accel state (bug fix
-    // 2.1-D6: previously sysctl stayed pinned to accel_cubic after stop,
-    // keeping new connections routed through a doomed-to-unregister algo).
-    //
-    // Edge case: if the captured value IS the algorithm we're about to
-    // load (e.g. a prior accel run exited abnormally and left sysctl
-    // pointing at accel_cubic, which is then still in-kernel because
-    // lingering sockets held it), restoring to that same name at
-    // shutdown would fail — by then our Link has dropped and the algo
-    // is unregistered, so `sysctl -w = accel_cubic` gets EINVAL.
-    // We coerce such captures to a built-in fallback (bbr → cubic →
-    // reno, whichever is registered) at capture time, keeping the
-    // shutdown restore path trivial.
-    let target_name = cfg.algorithm.default.clone();
-    let original_cc_ipv4 = capture_cc_with_fallback(algo::current_cc_ipv4().ok(), &target_name);
-    let original_cc_ipv6 = capture_cc_with_fallback(algo::current_cc_ipv6(), &target_name);
+    // The user-chosen algorithm must be among the loaded set.
+    let target_name = cfg.algorithm.clone();
+    if !loaded_algos.contains_key(&target_name) {
+        bail!(
+            "algorithm '{target_name}' specified in acc.conf failed to load. \
+             Loaded: {:?}. Check dmesg for the specific verifier error.",
+            names
+        );
+    }
+
+    // If brutal is the target, [brutal] section is mandatory + write rate.
+    let brutal_rate_mbps: Option<u32> = if target_name == "accel_brutal" {
+        let brutal_cfg = cfg
+            .brutal
+            .as_ref()
+            .ok_or_else(|| anyhow!("acc.conf: algorithm = \"accel_brutal\" requires [brutal] section"))?;
+        if brutal_cfg.rate_mbps == 0 || brutal_cfg.rate_mbps > 100_000 {
+            bail!(
+                "acc.conf: [brutal].rate_mbps must be in 1..=100000, got {}",
+                brutal_cfg.rate_mbps
+            );
+        }
+        let rate_bytes = brutal_cfg.rate_mbps as u64 * 1_000_000 / 8;
+        // SAFETY: we just verified target_name == "accel_brutal" and
+        // loaded_algos.contains_key(&target_name); load_brutal()
+        // produces LoadedAlgo::Brutal by construction; other variants
+        // are impossible here.
+        match loaded_algos
+            .get_mut(&target_name)
+            .expect("just verified loaded")
+        {
+            LoadedAlgo::Brutal(b) => b.set_rate(rate_bytes)?,
+            LoadedAlgo::Cubic(_) => unreachable!(
+                "accel_brutal name must map to LoadedAlgo::Brutal by ebpf_loader construction"
+            ),
+        }
+        println!(
+            "  brutal rate written: {} Mbps ({} byte/s)",
+            brutal_cfg.rate_mbps, rate_bytes
+        );
+        Some(brutal_cfg.rate_mbps)
+    } else {
+        None
+    };
+
+    // Capture pre-accel sysctl, coercing away from any accel-loaded name
+    // (we'd lose ability to restore once we drop those algos at shutdown).
+    let original_cc_ipv4 =
+        capture_cc_with_fallback(algo::current_cc_ipv4().ok(), &loaded_algos);
+    let original_cc_ipv6 = capture_cc_with_fallback(algo::current_cc_ipv6(), &loaded_algos);
     match &original_cc_ipv4 {
         Some(v4) => println!("  capturing pre-accel sysctl: {v4} (will restore on clean stop)"),
         None => eprintln!(
@@ -160,10 +203,8 @@ fn run_server() -> Result<()> {
         ),
     }
 
-    // Apply sysctl so the kernel uses our algorithm for new connections.
-    algo::set_cc_both(&target_name).with_context(|| {
-        format!("setting sysctl tcp_congestion_control={target_name}")
-    })?;
+    algo::set_cc_both(&target_name)
+        .with_context(|| format!("setting sysctl tcp_congestion_control={target_name}"))?;
     println!(
         "  kernel sysctl set: tcp_congestion_control={target_name} (ipv4{})",
         if algo::current_cc_ipv6().is_some() {
@@ -174,7 +215,6 @@ fn run_server() -> Result<()> {
     );
     println!();
 
-    // Resolve socket path and verify no other instance.
     let socket_path = socket::resolve_path(&cfg.runtime.socket);
     socket::prepare_path(&socket_path)?;
     let listener = socket::bind(&socket_path)?;
@@ -184,10 +224,11 @@ fn run_server() -> Result<()> {
         pid: std::process::id(),
         started_at: Instant::now(),
         socket_path: socket_path.clone(),
-        algo: Arc::new(Mutex::new(Some(loaded))),
+        algos: Arc::new(Mutex::new(loaded_algos)),
         target_algo: Arc::new(Mutex::new(target_name)),
         original_cc_ipv4,
         original_cc_ipv6,
+        brutal_rate_mbps,
         health_shutting_down: AtomicBool::new(false),
         health_last_ok: Mutex::new(None),
         jit_warned: AtomicBool::new(false),
@@ -195,7 +236,6 @@ fn run_server() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
-    // Socket thread — panic guard propagates to main shutdown.
     let socket_shutdown_tx = shutdown_tx.clone();
     let socket_state = Arc::clone(&state);
     thread::Builder::new()
@@ -212,10 +252,8 @@ fn run_server() -> Result<()> {
         })
         .context("spawning socket thread")?;
 
-    // Health thread.
     health::spawn(Arc::clone(&state)).context("spawning health thread")?;
 
-    // SIGINT / SIGTERM handler.
     let signal_tx = shutdown_tx.clone();
     ctrlc::set_handler(move || {
         let _ = signal_tx.send(());
@@ -227,21 +265,9 @@ fn run_server() -> Result<()> {
     let _ = shutdown_rx.recv();
 
     println!("shutting down...");
-    // Stop the health thread before we tear down the algo it monitors.
-    // Otherwise health could race with our cleanup: detect our
-    // intentional sysctl restore as a "drift" and try to reconcile.
     state.health_shutting_down.store(true, Ordering::Relaxed);
 
-    // Restore sysctl to pre-accel value FIRST, before dropping the algo.
-    // Order matters:
-    //   1. sysctl restored → new TCP connections use the original CC,
-    //      NOT accel_cubic (which is about to be unregistered).
-    //   2. Link dropped → kernel unregisters accel_cubic from
-    //      tcp_available_congestion_control.
-    //   3. Skel dropped → map fds closed, kernel GCs the map once all
-    //      existing connections using accel_cubic release their refs.
-    // If we did 2 before 1, a new connection in the microsecond gap
-    // would try to look up accel_cubic right as it's disappearing.
+    // 1. Restore sysctl FIRST so new connections use the original CC.
     if let Some(orig_v4) = state.original_cc_ipv4.as_deref() {
         let orig_v6 = state.original_cc_ipv6.as_deref();
         match algo::set_cc(orig_v4, orig_v6) {
@@ -255,28 +281,29 @@ fn run_server() -> Result<()> {
         }
     }
 
-    // Explicitly drop the algo while state is reachable, so unregister-
-    // related log lines land before socket removal.
-    if let Some(algo) = state.algo.lock().ok().and_then(|mut g| g.take()) {
-        println!("unregistering struct_ops {}...", algo.name);
-        drop(algo);
+    // 2. Drop all algorithms. HashMap::clear runs each LoadedAlgo's Drop,
+    //    which fires Link::drop (unregister) then Skel::drop (close fds).
+    //    Order across algorithms doesn't matter since each is independent
+    //    in the kernel.
+    if let Ok(mut g) = state.algos.lock() {
+        let names: Vec<String> = g.keys().cloned().collect();
+        if !names.is_empty() {
+            println!("unregistering struct_ops: {}", names.join(", "));
+        }
+        g.clear();
     }
+
     let _ = std::fs::remove_file(&socket_path);
     let _ = incidents::append(Event::Shutdown { reason: "clean" });
     Ok(())
 }
 
-/// Scan `dmesg` for the most recent "Killed process <pid> (accel)" line,
-/// indicating the previous run died to OOM. Returns the victim pid if
-/// found. Best-effort: needs root and a recent ring buffer, silently
-/// returns None if dmesg can't be read.
 fn scan_dmesg_oom() -> Option<u32> {
     let out = Command::new("dmesg").output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     for line in s.lines().rev() {
         let lower = line.to_lowercase();
         if lower.contains("killed process") && lower.contains("(accel") {
-            // Pattern: "... Killed process 12345 (accel) ..."
             if let Some(tail) = lower.split("killed process").nth(1) {
                 if let Some(pid_str) = tail.split_whitespace().next() {
                     return pid_str.parse().ok();
@@ -296,18 +323,22 @@ fn jit_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// If the captured sysctl value is the same algorithm we're about to
-/// load (rare edge case: previous accel run crashed and left sysctl
-/// pointing at accel_cubic), substitute a built-in fallback. Otherwise
-/// return the value unchanged. `None` in → `None` out.
-fn capture_cc_with_fallback(captured: Option<String>, target: &str) -> Option<String> {
+/// If the captured sysctl value is one of the algorithms accel itself
+/// loaded (rare edge case: previous accel run crashed and left sysctl
+/// pointing at accel_cubic / accel_brutal), substitute a built-in
+/// fallback. Otherwise return the value unchanged.
+///
+/// Reasoning: at shutdown we'll drop our algorithms, after which
+/// `sysctl -w tcp_congestion_control=accel_xxx` would EINVAL. A built-in
+/// (bbr / cubic / reno) is always available regardless of accel state.
+fn capture_cc_with_fallback(
+    captured: Option<String>,
+    accel_loaded: &HashMap<String, LoadedAlgo>,
+) -> Option<String> {
     let captured = captured?;
-    if captured != target {
-        return Some(captured);
+    if !accel_loaded.contains_key(&captured) {
+        return Some(captured); // already a kernel built-in
     }
-    // Pick the most preferred fallback that's currently registered.
-    // At startup (before we load target) every kernel built-in should be
-    // registered, so the first candidate usually wins.
     for candidate in ["bbr", "cubic", "reno"] {
         if algo::is_registered(candidate).unwrap_or(false) {
             eprintln!(
@@ -316,6 +347,5 @@ fn capture_cc_with_fallback(captured: Option<String>, target: &str) -> Option<St
             return Some(candidate.to_string());
         }
     }
-    // Last resort: cubic is always compiled into Linux.
     Some("cubic".to_string())
 }
