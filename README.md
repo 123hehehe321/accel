@@ -2,6 +2,15 @@
 
 > **一句话介绍**：装在 Linux 服务器上的 TCP 加速器,使用 eBPF struct_ops 自定义 TCP 拥塞控制算法,和锐速同层级但架构更灵活。所有 TCP 服务零改动、真实客户端 IP 保留、与任何其他服务零冲突。
 
+**当前版本**: v0.2,2.3 收官 (2026-04)
+
+**支持算法**:
+- `accel_cubic` — 2.1 基线,等效内核 CUBIC,稳定路径
+- `accel_brutal` — 2.3 新增,跨境高丢包场景的激进算法
+  (基于 [apernet/tcp-brutal](https://github.com/apernet/tcp-brutal),自写 BPF struct_ops 实现)
+
+**验收**: 7 场景 VPS 实测全 PASS (verify-2.3.sh A/B/C/D/E/F/G)。
+
 ---
 
 ## 目录
@@ -834,6 +843,40 @@ accel 的 `accel_brutal` 实现使用全局 BPF map 配置 rate
 - 启动时 `acc.conf [brutal].rate_mbps` 的值写入 map
 - 运行期间 health 重载 brutal 时,自动用同一值再写一次
 - `./accel stop` → 重启 → 重读配置文件,以新值重写
+
+### 12.7 2.3 已知 gap(2.4 跟进)
+
+7 场景 VPS 验收虽全 PASS,但以下项目本版本未深度验证或推迟,留作 2.4
+跟进:
+
+- **性能基准未真实验证** — scenario C 的吞吐数字会受 curl 解析 / 物理
+  链路 / VPS 出网带宽多重影响,不能作为算法性能基线。
+  → 2.4 用 iperf3 + 跨境真实链路测试。
+- **80% ack rate 钳制未在 VPS 动态验证** — `MIN_ACK_RATE_PERCENT=80` 是
+  BPF C 硬编码常量(`accel_brutal.bpf.c:49,154-155`),代码审计验证。
+  VPS 上跑 tc netem 模拟丢包会断 SSH,人造丢包也不等于真实跨境场景。
+  → 2.4 长期使用观察。
+- **stop 后 struct_ops 残留** — `bpftool struct_ops show` 仍能看到旧 id,
+  这是内核 socket pinning 的正确行为(已在 §12.5 文档化)。新建连接
+  使用新 cc,残留 id 在所有旧 socket 关闭后自动消失。**不是 bug**。
+- **AI 调参接口预留** — `brutal_rate_config` BPF map 已暴露给用户态,
+  运行期间可写。`brutal_socket_count` 也可读。这两个 map 是 2.4+ 动态
+  调参 / AI 控制路径的接入点。
+
+### 12.8 2.3 verifier 修复链(技术债提示)
+
+accel_brutal 的 BPF struct_ops 在 v6.12 内核上经历了 4 次 verifier 撞坑,
+最终方案在 main 分支 commit 链上保留可追溯:
+
+| 阶段 | commit | 修复 |
+|---|---|---|
+| D4.1 | `f0ada51` | brutal_main 改 `__u32` 返回(struct_ops 要求标量) |
+| D4.2 | `0edf01b` | `barrier_var(slot)` 让 verifier 跨 u64→u32 cast 重新追踪上界 |
+| D4.3 | `f17cf5d` | 静态 `#pragma unroll` 循环替代动态 slot 下标 (trusted_ptr 不允许变量偏移) |
+| D4.4 | `0ea3869` | 删 `sk->sk_pacing_status = SK_PACING_NEEDED` 直写 (Plan B,运行时静默截断 init) |
+
+未来在其他内核版本上若再撞 verifier,先看这 4 个 commit 的 diff 是否
+覆盖了相同模式。
 
 ---
 
