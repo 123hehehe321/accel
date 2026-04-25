@@ -814,6 +814,27 @@ sudo ss -tniO | grep accel_cubic
 如果这条命令无输出但 `bpftool struct_ops show` 仍看到 `accel_cubic`,
 说明 kernel GC 还未及时 —— 再等 30 秒基本会消失。
 
+### 12.6 brutal 算法的 per-socket vs 全局速率限制
+
+accel 的 `accel_brutal` 实现使用全局 BPF map 配置 rate
+(所有 brutal socket 共享同一速率)。
+
+原版 `tcp-brutal` (apernet/tcp-brutal) 通过
+`setsockopt(TCP_BRUTAL_PARAMS)` 支持 per-socket 不同速率,accel 简化为
+全局以保持架构简洁:
+
+- 配置文件 `[brutal] rate_mbps = 100` → 所有用 `accel_brutal` 的 TCP
+  socket 共享 100 Mbps **单连接**速率上限
+- 不支持"连接 A 用 100M、连接 B 用 50M"的 per-socket 差异化
+- 未来扩展可加 setsockopt 路径(留作 2.4+ 任务)
+- BPF map `brutal_rate_config` 暴露给用户态,运行时可改(为后续
+  AI 调参等动态控制路径预留接口)
+
+**生效范围**:
+- 启动时 `acc.conf [brutal].rate_mbps` 的值写入 map
+- 运行期间 health 重载 brutal 时,自动用同一值再写一次
+- `./accel stop` → 重启 → 重读配置文件,以新值重写
+
 ---
 
 ## 13. 编码规范与工作指引
