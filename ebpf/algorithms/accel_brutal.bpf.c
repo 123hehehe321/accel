@@ -244,25 +244,36 @@ __u32 BPF_PROG(brutal_main, struct sock *sk, __u32 ack, int flag,
 		return 0;
 
 	__u64 sec = tp->tcp_mstamp / USEC_PER_SEC;
-	__u32 slot = sec % PKT_INFO_SLOTS;
-	/* Force verifier to re-track slot's range from this point. The
-	 * explicit if below would suffice on most kernels, but v6.12's
-	 * verifier loses the modulo's upper bound across the u64→u32 cast
-	 * and rejects the array math otherwise. barrier_var() is the BPF
-	 * community's standard fix for this class of cast-bound loss. */
-	barrier_var(slot);
-	if (slot >= PKT_INFO_SLOTS)
-		return 0;
-	struct brutal_pkt_info *pkt = &b->slots[slot];
 
-	if (pkt->sec == sec) {
-		pkt->acked  += rs->acked_sacked;
-		pkt->losses += rs->losses;
-	} else {
-		/* Slot is stale (different second hashed here); overwrite. */
-		pkt->sec    = sec;
-		pkt->acked  = rs->acked_sacked;
-		pkt->losses = rs->losses;
+	/* Slot lookup must use static (constant) indices because the v6.12
+	 * verifier rejects variable offsets on trusted_ptr_tcp_sock — even
+	 * a properly bounded slot index counts as a variable offset and is
+	 * refused. Two unrolled passes preserve the original semantics:
+	 *   pass 1 — accumulate into the slot already holding this sec;
+	 *   pass 2 — if no match, claim the first expired/empty slot.
+	 * #pragma unroll lets the verifier see only constant indices. */
+	int found = 0;
+	#pragma unroll
+	for (int i = 0; i < PKT_INFO_SLOTS; i++) {
+		if (b->slots[i].sec == sec) {
+			b->slots[i].acked  += rs->acked_sacked;
+			b->slots[i].losses += rs->losses;
+			found = 1;
+			break;
+		}
+	}
+
+	if (!found) {
+		#pragma unroll
+		for (int i = 0; i < PKT_INFO_SLOTS; i++) {
+			if (b->slots[i].sec + PKT_INFO_SLOTS <= sec ||
+			    b->slots[i].sec == 0) {
+				b->slots[i].sec    = sec;
+				b->slots[i].acked  = rs->acked_sacked;
+				b->slots[i].losses = rs->losses;
+				break;
+			}
+		}
 	}
 
 	brutal_update_rate(sk);
