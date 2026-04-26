@@ -121,6 +121,43 @@ fn reload_one(state: &State, name: &str) {
         new_algo
     };
 
+    // For smart, restore the saved [smart] config: re-write smart_config_map
+    // and smart_dup_config (their backing kernel maps are recreated on
+    // reload, so they're zero by default), then re-attach the tc-bpf egress
+    // filter (the old hook was detached when the prior LoadedSmart dropped).
+    // state.smart_saved is set at startup iff target was accel_smart.
+    let new_algo = if name == "accel_smart" {
+        if let Some(saved) = state.smart_saved.as_ref() {
+            let mut a = new_algo;
+            match &mut a {
+                LoadedAlgo::Smart(sm) => {
+                    if let Err(e) = sm.set_config(
+                        saved.rate_bytes,
+                        saved.loss_lossy_bp,
+                        saved.loss_congest_bp,
+                        saved.rtt_congest_pct,
+                    ) {
+                        eprintln!("health: re-apply smart config after reload failed: {e:#}");
+                    }
+                    if let Err(e) =
+                        sm.set_dup_config(saved.ifindex, saved.port_min, saved.port_max)
+                    {
+                        eprintln!("health: re-apply smart dup_config after reload failed: {e:#}");
+                    }
+                    if let Err(e) = sm.attach_tc_egress(saved.ifindex) {
+                        eprintln!("health: re-attach smart tc/egress after reload failed: {e:#}");
+                    }
+                }
+                _ => unreachable!("load_smart must return LoadedAlgo::Smart"),
+            }
+            a
+        } else {
+            new_algo
+        }
+    } else {
+        new_algo
+    };
+
     algos.insert(name.to_string(), new_algo);
     drop(algos); // release before sysctl side-effect
 

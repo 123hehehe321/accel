@@ -9,6 +9,24 @@ use std::time::{Duration, Instant};
 use crate::algo;
 use crate::ebpf_loader::LoadedAlgo;
 
+/// Resolved-form snapshot of `acc.conf [smart]` set at startup. The raw
+/// `SmartConfig` (config.rs) holds user input; this struct holds the
+/// post-validation runtime values: rate already converted to byte/s,
+/// interface name resolved to ifindex, port range parsed. health.rs
+/// consults it to re-apply settings if accel_smart is reloaded after
+/// an external unregister; status.rs reads it for display.
+#[derive(Clone)]
+pub struct SmartSavedCfg {
+    pub rate_bytes: u64,
+    pub interface: String,
+    pub ifindex: u32,
+    pub loss_lossy_bp: u32,
+    pub loss_congest_bp: u32,
+    pub rtt_congest_pct: u32,
+    pub port_min: u16,
+    pub port_max: u16,
+}
+
 /// Shared state published to the socket server for status requests.
 ///
 /// 2.3-D3 changed `algo: Option<LoadedAlgo>` (single-slot) to
@@ -32,6 +50,10 @@ pub struct State {
     /// `Some(rate_mbps)` iff `accel_brutal` was loaded; consumed by
     /// health.rs to re-apply rate after a brutal reload.
     pub brutal_rate_mbps: Option<u32>,
+    /// `Some(_)` iff accel_smart was the startup target and the
+    /// `[smart]` section validated. Consumed by health.rs to re-apply
+    /// config + dup_config + tc attach after a smart reload.
+    pub smart_saved: Option<SmartSavedCfg>,
     pub health_shutting_down: AtomicBool,
     pub health_last_ok: Mutex<Option<Instant>>,
     pub jit_warned: AtomicBool,
@@ -102,6 +124,30 @@ pub fn render(state: &State) -> String {
     if let Some(rate_mbps) = state.brutal_rate_mbps {
         let _ = writeln!(s, "  brutal rate:       {rate_mbps} Mbps");
     }
+    if let Some(saved) = state.smart_saved.as_ref() {
+        // 1 Mbps = 125_000 byte/s.
+        let rate_mbps = saved.rate_bytes / 125_000;
+        let _ = writeln!(s, "  smart rate:        {rate_mbps} Mbps");
+        let _ = writeln!(
+            s,
+            "  smart thresholds:  lossy={}bp congest={}bp rtt={}%",
+            saved.loss_lossy_bp, saved.loss_congest_bp, saved.rtt_congest_pct
+        );
+        let _ = writeln!(
+            s,
+            "  smart interface:   {} (tc-bpf attached)",
+            saved.interface
+        );
+        if saved.port_min > 0 {
+            let _ = writeln!(
+                s,
+                "  smart dup ports:   {}-{}",
+                saved.port_min, saved.port_max
+            );
+        } else {
+            let _ = writeln!(s, "  smart dup ports:   all TCP");
+        }
+    }
     if sysctl_v4 != target {
         let _ = writeln!(
             s,
@@ -148,6 +194,34 @@ fn render_connections(state: &State, s: &mut String) {
     });
     if let Some(n) = brutal_count {
         let _ = writeln!(s, "  brutal sockets:    {n}");
+    }
+
+    // smart_sockets + state distribution only when smart is currently loaded.
+    let smart_info = state.algos.lock().ok().and_then(|g| {
+        g.get("accel_smart").and_then(|a| match a {
+            LoadedAlgo::Smart(sm) => {
+                let count = sm.socket_count().ok()?;
+                let states = sm.state_counts().ok()?;
+                Some((count, states))
+            }
+            _ => None,
+        })
+    });
+    if let Some((count, [good, lossy, congest])) = smart_info {
+        let _ = writeln!(s, "  smart sockets:     {count}");
+        let total = good + lossy + congest;
+        if total > 0 {
+            let _ = writeln!(
+                s,
+                "  smart state:       GOOD {} ({}%) | LOSSY {} ({}%) | CONGEST {} ({}%)",
+                good,
+                good * 100 / total,
+                lossy,
+                lossy * 100 / total,
+                congest,
+                congest * 100 / total
+            );
+        }
     }
 }
 

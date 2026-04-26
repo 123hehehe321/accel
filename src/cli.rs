@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::process::{Command, ExitCode};
@@ -12,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::ebpf_loader::LoadedAlgo;
 use crate::incidents::{self, Event};
+use crate::status::SmartSavedCfg;
 use crate::{algo, config, ebpf_loader, health, socket, status};
 
 const CONFIG_PATH: &str = "./acc.conf";
@@ -190,6 +192,68 @@ fn run_server() -> Result<()> {
         None
     };
 
+    // If smart is the target, [smart] section is mandatory + write
+    // smart_config_map / smart_dup_config / attach tc-bpf egress.
+    let smart_saved: Option<SmartSavedCfg> = if target_name == "accel_smart" {
+        let smart_cfg = cfg.smart.as_ref().ok_or_else(|| {
+            anyhow!("acc.conf: algorithm = \"accel_smart\" requires [smart] section")
+        })?;
+        if smart_cfg.rate_mbps == 0 || smart_cfg.rate_mbps > 100_000 {
+            bail!(
+                "acc.conf: [smart].rate_mbps must be in 1..=100000, got {}",
+                smart_cfg.rate_mbps
+            );
+        }
+        let ifindex = read_ifindex(&smart_cfg.interface)?;
+        let (port_min, port_max) = parse_port_range(&smart_cfg.duplicate_ports)?;
+        let rate_bytes = smart_cfg.rate_mbps as u64 * 1_000_000 / 8;
+
+        match loaded_algos
+            .get_mut(&target_name)
+            .expect("just verified loaded")
+        {
+            LoadedAlgo::Smart(sm) => {
+                sm.set_config(
+                    rate_bytes,
+                    smart_cfg.loss_lossy_bp,
+                    smart_cfg.loss_congest_bp,
+                    smart_cfg.rtt_congest_pct,
+                )?;
+                sm.set_dup_config(ifindex, port_min, port_max)?;
+                sm.attach_tc_egress(ifindex)?;
+            }
+            LoadedAlgo::Cubic(_) | LoadedAlgo::Brutal(_) => unreachable!(
+                "accel_smart name must map to LoadedAlgo::Smart by ebpf_loader construction"
+            ),
+        }
+        println!(
+            "  smart config: {} Mbps, interface={} (ifindex={})",
+            smart_cfg.rate_mbps, smart_cfg.interface, ifindex
+        );
+        println!(
+            "  smart thresholds: lossy={}bp congest={}bp rtt={}%",
+            smart_cfg.loss_lossy_bp, smart_cfg.loss_congest_bp, smart_cfg.rtt_congest_pct
+        );
+        if port_min > 0 {
+            println!("  smart dup ports: {port_min}-{port_max}");
+        } else {
+            println!("  smart dup ports: all TCP");
+        }
+        println!("  tc-bpf attached: ifindex={ifindex} egress");
+        Some(SmartSavedCfg {
+            rate_bytes,
+            interface: smart_cfg.interface.clone(),
+            ifindex,
+            loss_lossy_bp: smart_cfg.loss_lossy_bp,
+            loss_congest_bp: smart_cfg.loss_congest_bp,
+            rtt_congest_pct: smart_cfg.rtt_congest_pct,
+            port_min,
+            port_max,
+        })
+    } else {
+        None
+    };
+
     // Capture pre-accel sysctl, coercing away from any accel-loaded name
     // (we'd lose ability to restore once we drop those algos at shutdown).
     let original_cc_ipv4 =
@@ -229,6 +293,7 @@ fn run_server() -> Result<()> {
         original_cc_ipv4,
         original_cc_ipv6,
         brutal_rate_mbps,
+        smart_saved,
         health_shutting_down: AtomicBool::new(false),
         health_last_ok: Mutex::new(None),
         jit_warned: AtomicBool::new(false),
@@ -348,4 +413,78 @@ fn capture_cc_with_fallback(
         }
     }
     Some("cubic".to_string())
+}
+
+/// Resolve a network interface name (e.g. "eth0") to its kernel
+/// ifindex. Wraps `if_nametoindex(3)`. Errors with a helpful message
+/// when the interface doesn't exist — we can't proceed without an
+/// ifindex to attach the tc/egress filter to.
+fn read_ifindex(name: &str) -> Result<u32> {
+    let cstr = CString::new(name)
+        .with_context(|| format!("interface name {name:?} contains a NUL byte"))?;
+    // SAFETY: `cstr` outlives the call; if_nametoindex reads only via
+    // the pointer for the duration of the call. Returns 0 on failure
+    // (unknown interface) and sets errno; we map 0 to a typed error.
+    let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+    if idx == 0 {
+        let err = std::io::Error::last_os_error();
+        bail!("interface {name:?} not found ({err}); set [smart].interface to an existing device (try `ip link`)");
+    }
+    Ok(idx)
+}
+
+/// Parse a port range string of the form `"min-max"`. An empty
+/// string disables filtering and is encoded as `(0, 0)` — the
+/// tc-bpf program treats `port_min == 0` as "clone every TCP packet
+/// during LOSSY".
+fn parse_port_range(s: &str) -> Result<(u16, u16)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok((0, 0));
+    }
+    let (lo, hi) = s.split_once('-').ok_or_else(|| {
+        anyhow!(
+            "[smart].duplicate_ports must be either empty or \"min-max\", got {s:?}"
+        )
+    })?;
+    let lo: u16 = lo
+        .trim()
+        .parse()
+        .with_context(|| format!("[smart].duplicate_ports lower bound: {:?}", lo.trim()))?;
+    let hi: u16 = hi
+        .trim()
+        .parse()
+        .with_context(|| format!("[smart].duplicate_ports upper bound: {:?}", hi.trim()))?;
+    if lo == 0 || hi == 0 {
+        bail!("[smart].duplicate_ports endpoints must be > 0 (use \"\" to disable filtering)");
+    }
+    if lo > hi {
+        bail!("[smart].duplicate_ports invalid: {lo} > {hi}");
+    }
+    Ok((lo, hi))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_port_range;
+
+    #[test]
+    fn port_range_empty_is_no_filter() {
+        assert_eq!(parse_port_range("").unwrap(), (0, 0));
+        assert_eq!(parse_port_range("   ").unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn port_range_basic() {
+        assert_eq!(parse_port_range("5500-20000").unwrap(), (5500, 20000));
+        assert_eq!(parse_port_range(" 80 - 443 ").unwrap(), (80, 443));
+    }
+
+    #[test]
+    fn port_range_rejects_bad_input() {
+        assert!(parse_port_range("100").is_err());
+        assert!(parse_port_range("100-50").is_err()); // lo > hi
+        assert!(parse_port_range("0-100").is_err()); // zero endpoint
+        assert!(parse_port_range("abc-100").is_err());
+    }
 }

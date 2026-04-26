@@ -18,9 +18,7 @@ pub struct Config {
     pub brutal: Option<BrutalConfig>,
 
     /// Required only when `algorithm = "accel_smart"`. Validated at
-    /// startup in `cli::run_server` (D5). At D4 the type exists so the
-    /// loader has a place to read its values from.
-    #[allow(dead_code)] // first reader added in D5 (cli.rs).
+    /// startup in `cli::run_server`.
     pub smart: Option<SmartConfig>,
 
     pub runtime: Runtime,
@@ -37,7 +35,6 @@ pub struct BrutalConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // every field below has its first reader in D5 (cli.rs).
 pub struct SmartConfig {
     /// GOOD-state target send rate per accel_smart-managed socket, in
     /// megabits per second. Same semantics as BrutalConfig::rate_mbps —

@@ -168,7 +168,6 @@ impl Drop for LoadedSmart {
 // across thread boundaries is sound.
 unsafe impl Send for LoadedSmart {}
 
-#[allow(dead_code)] // every method below has its first caller in D5.
 impl LoadedSmart {
     /// Write the user-configured GOOD-state target rate (byte/s) and
     /// classification thresholds into `smart_config_map`. The BPF
