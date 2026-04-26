@@ -2,22 +2,26 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D4 (glibc 2.34 build)
+## 当前版本: 2.5-smart-D5 (glibc 2.34 build)
 
-- **2.5-D4 阶段**: Rust 端 LoadedSmart 完整 API 接通 (struct_ops 半边
-  + tc-bpf 半边经由 reuse_fd 共享 smart_link_state map)。tc 程序
-  loaded 进内核但**还没 attach** 到 egress hook —— attach 在 D5
-  (cli.rs 解析 [smart] 段后调 attach_tc_egress)。
-- **D4 验收脚本** `verify-smart-d4.sh`:
-  * D2 回归 (accel_smart 仍在 loaded 列表)
-  * 新增 `smart_dup` BPF 程序 verifier 通过 (D3 写的 BPF C 第一次
-    进 kernel)
-  * 新增 `smart_link_state` map 在内核里只有一份 (`reuse_fd` 真生效)
-  * stop 后 dup 程序 + 共享 map 干净卸载
-- **accel binary 更新**: `load_smart()` 现在 load 两个 BPF 对象 (smart
-  struct_ops + smart_dup tc-bpf), `LoadedSmart` 加 5 个新方法 —
-  `set_config / set_dup_config / attach_tc_egress / socket_count /
-  state_counts`, 全部 D5 才有调用方。
+- **2.5-D5 阶段**: cli/status/health 接通 — `algorithm = "accel_smart"`
+  端到端可用。启动时 cli.rs 解析 `[smart]` 段、写两个 BPF 配置 map、
+  attach tc-bpf 到 egress；`./accel status` 多了 smart 段；
+  health.rs 在外部 unregister 后能自愈重写 smart 配置 + 重 attach tc。
+- **D5 验收脚本** `verify-smart-d5.sh`:
+  * 负向测试: target=smart 但缺 [smart] 段 → 必须 bail
+  * 正向测试: 启动日志含 "smart config / thresholds / dup ports / tc-bpf attached"
+  * tc 真挂上: `tc filter show dev <iface> egress` 含 smart_dup
+  * status 输出含 smart rate / thresholds / interface / sockets / state
+  * stop 后 tc filter 干净卸载
+- **accel binary 更新**: 完整接通后体积从 1.27 MB → 1.29 MB。
+- **未变**: 2.3 的 cubic / brutal 行为完全不动。
+
+## 历史版本: 2.5-smart-D4 (kernel-side 验收)
+
+- D4 阶段只 load tc-bpf 程序进 kernel 但不 attach 到 egress hook;
+  验证 reuse_fd 共享 smart_link_state map。`verify-smart-d4.sh` 仍可用
+  作回归测试。
 
 ## 历史版本: 2.5-smart-D2 path A (glibc 2.34 build)
 
@@ -91,41 +95,42 @@ mv acc.conf.example acc.conf
 vim acc.conf      # 选 algorithm + 设 brutal rate_mbps (如选 brutal)
 ```
 
-### 2.5-D4 验收 (kernel-side: dup 程序 verifier + reuse_fd 验证)
+### 2.5-D5 验收 (端到端接通: 配置 → tc attach → status)
 
 ```bash
-# 已下 accel binary 的话替换一下:
+# 替换旧 binary, 拿新脚本:
 curl -LO https://github.com/123hehehe321/accel/raw/binaries/accel
-curl -LO https://github.com/123hehehe321/accel/raw/binaries/verify-smart-d4.sh
-chmod +x accel verify-smart-d4.sh
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/verify-smart-d5.sh
+chmod +x accel verify-smart-d5.sh
 
-# 跑 D4 验收:
-sudo ./verify-smart-d4.sh
+# 跑 D5 验收:
+sudo ./verify-smart-d5.sh
 ```
 
-D4 脚本检查:
+D5 脚本检查 7 项:
 1. binary md5
-2. 内核 + BTF + bpftool sanity
-3. **D2 回归**: 启动 accel,`loaded:` 行仍含 accel_smart
-4. **D3 verifier 验收**: `bpftool prog show | grep smart_dup` ≥ 1
-   (BPF C 第一次进 kernel)
-5. **reuse_fd 验证**: `bpftool map show name smart_link_state` 计数 = 1
-   (struct_ops 和 tc-bpf 共用同一份 map; 计数 = 2 表示 reuse_fd 没生效,
-   两边解耦,LOSSY 信号永远传不到 dup 程序)
-6. clean stop 后 dup 程序 + 共享 map 全部卸载
+2. 内核 + BTF + bpftool + tc(iproute2) sanity, 自动检出默认路由网卡
+3. **负向测试**: `algorithm = "accel_smart"` 但缺 `[smart]` 段 → 必须 bail
+   (确认 cli.rs 验证生效)
+4. **正向测试**: 写完整 [smart] 配置启动, 期望日志包含
+   `smart config: 100 Mbps`, `smart thresholds: ...`,
+   `smart dup ports: 5500-20000`, `tc-bpf attached: ifindex=...`
+5. **tc 真挂上**: `tc filter show dev <iface> egress` 显示 smart_dup
+   (D4 只 load 不 attach; D5 才真挂)
+6. **status 输出**: `./accel status` 含 smart rate / thresholds /
+   interface / dup ports / sockets / state 行
+7. clean stop 后 tc filter 自动 detach (Drop 路径生效)
 
-失败时脚本会自动抓 accel 启动日志 + dmesg verifier 切片, 完整贴给架构师 ——
-不要本地改 BPF 代码 (PROJECT_CONTEXT §5.4)。
+失败时脚本会抓 accel stdout + tc 输出 + warning, 完整贴给架构师。
+
+### 2.5-D4 验收 (kernel-side: dup 程序 verifier + reuse_fd 验证)
+
+`verify-smart-d4.sh` 仍可用作回归测试 (检查 dup BPF 程序 verifier + map 共享)。
 
 ### 2.5-D2 历史验收脚本 (仍可用)
 
-```bash
-curl -LO https://github.com/123hehehe321/accel/raw/binaries/verify-smart-d2.sh
-chmod +x verify-smart-d2.sh
-sudo ./verify-smart-d2.sh
-```
-
-D2 只校验 accel_smart struct_ops verifier 通过 (D4 是 D2 的超集)。
+`verify-smart-d2.sh` — 最小验收 (只看 accel_smart 在 loaded 列表)。
+D5 是 D4 + D2 的超集。
 
 ## 启动 (cubic 默认)
 
@@ -163,6 +168,45 @@ socket = ""
 启动同上,会多两行输出:
 ```
   brutal rate written: 100 Mbps (12500000 byte/s)
+```
+
+## 启动 (smart, 2.5 新增)
+
+修改 acc.conf:
+```toml
+algorithm = "accel_smart"
+
+[smart]
+rate_mbps = 100                  # GOOD 状态下的单连接速率上限 (Mbps)
+interface = "eth0"               # 网卡名,用 `ip link` 查
+duplicate_ports = "5500-20000"   # 多倍发包的端口范围, "" = 不限
+loss_lossy_bp = 100              # 丢包率 ≥ 1% → LOSSY (basis points)
+loss_congest_bp = 1500           # 丢包率 ≥ 15% → CONGEST
+rtt_congest_pct = 50             # RTT 膨胀 ≥ 50% → CONGEST
+
+[runtime]
+socket = ""
+```
+
+启动日志:
+```
+  loaded: accel_brutal, accel_cubic, accel_smart
+  smart config: 100 Mbps, interface=eth0 (ifindex=2)
+  smart thresholds: lossy=100bp congest=1500bp rtt=50%
+  smart dup ports: 5500-20000
+  tc-bpf attached: ifindex=2 egress
+```
+
+`./accel status` 多 smart 段:
+```
+  smart rate:        100 Mbps
+  smart thresholds:  lossy=100bp congest=1500bp rtt=50%
+  smart interface:   eth0 (tc-bpf attached)
+  smart dup ports:   5500-20000
+
+connections:
+  smart sockets:     N
+  smart state:       GOOD A (X%) | LOSSY B (Y%) | CONGEST C (Z%)
 ```
 
 ## 常用命令
@@ -209,7 +253,7 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `44dc6ce7b920531be115c8805d8874bc`
-- **accel 大小**: 1,266,784 字节
+- **accel MD5**: `8d332b9353d036fe044f885935495e51`
+- **accel 大小**: 1,290,912 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
