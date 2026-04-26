@@ -39,8 +39,14 @@ mod accel_smart_skel {
     include!(concat!(env!("OUT_DIR"), "/accel_smart.skel.rs"));
 }
 
+#[allow(dead_code, unused_imports, clippy::all)]
+mod accel_smart_dup_skel {
+    include!(concat!(env!("OUT_DIR"), "/accel_smart_dup.skel.rs"));
+}
+
 use accel_brutal_skel::{AccelBrutalSkel, AccelBrutalSkelBuilder};
 use accel_cubic_skel::{AccelCubicSkel, AccelCubicSkelBuilder};
+use accel_smart_dup_skel::{AccelSmartDupSkel, AccelSmartDupSkelBuilder};
 use accel_smart_skel::{AccelSmartSkel, AccelSmartSkelBuilder};
 
 /// Per-algorithm Skel + Link bundle for the cubic baseline. Dropping it
@@ -102,13 +108,208 @@ impl LoadedBrutal {
     }
 }
 
-/// Drop guard for accel_smart. D2 ships only the loader plumbing — D4
-/// will extend with set_config / socket_count / state_counts methods.
-/// At D2 the variant exists purely to put the kernel verifier through
-/// its paces at accel startup; no runtime API is consumed yet.
+/// Per-algorithm bundle for accel_smart. Holds the struct_ops half
+/// (smart skel and Link) together with the tc-bpf egress half (dup
+/// skel and optional TcHook); their lifetimes are coupled because the
+/// two halves share the `smart_link_state` BPF map (smart writes, dup
+/// reads) and the tc filter must be detached before the dup program's
+/// fd is closed.
+///
+/// Field declaration order is the Drop order. Combined with
+/// `Drop for LoadedSmart` (which runs before field drops), the cleanup
+/// sequence is: tc detach (Drop body) then tc_hook field drop (no-op,
+/// TcHook is Copy) then _link drops (struct_ops unregister) then
+/// dup_skel drops (close dup fds, releasing the reused
+/// smart_link_state ref) then skel drops (close smart fds;
+/// smart_link_state refcount hits zero).
 pub struct LoadedSmart {
+    /// `None` until `attach_tc_egress` succeeds. Set by cli (D5) once
+    /// the user-configured network interface has been resolved.
+    tc_hook: Option<libbpf_rs::TcHook>,
     _link: Link,
-    _skel: AccelSmartSkel<'static>,
+    /// tc-bpf side. Held without underscore because we access
+    /// `dup_skel.maps.smart_dup_config` and `dup_skel.progs.smart_dup`
+    /// in the runtime API methods.
+    dup_skel: AccelSmartDupSkel<'static>,
+    /// struct_ops side. Held without underscore because we access
+    /// `skel.maps.smart_config_map / smart_socket_count /
+    /// smart_state_count`.
+    skel: AccelSmartSkel<'static>,
+}
+
+impl Drop for LoadedSmart {
+    fn drop(&mut self) {
+        // Detach the egress filter so it doesn't outlive accel. We
+        // intentionally do NOT call `destroy()` — that tears down the
+        // entire clsact qdisc, which other tools (Cilium, tc CLI) may
+        // share. `detach()` removes only our smart_dup filter.
+        if let Some(hook) = self.tc_hook.as_mut() {
+            let _ = hook.detach();
+        }
+    }
+}
+
+// SAFETY: LoadedSmart needs to live inside `Arc<Mutex<HashMap<String,
+// LoadedAlgo>>>` (see `status::State::algos`), which requires
+// `LoadedAlgo: Send`. The Skel and Link halves are already Send via
+// libbpf-rs's own bounds; the only non-Send component is the inner
+// `bpf_tc_hook` struct, which holds a `*const c_char qdisc` field
+// (libbpf 1.4+ binding addition).
+//
+// In our usage:
+//   1. `bpf_tc_hook::default()` zeros the struct, leaving qdisc = NULL.
+//   2. We only call `.ifindex()` and `.attach_point(TC_EGRESS)` —
+//      neither touches `qdisc`.
+//   3. `TC_EGRESS` is a built-in attach point handled by clsact, so
+//      libbpf never dereferences `qdisc` for our hooks.
+//
+// Hence the raw pointer is provably always NULL throughout the
+// lifetime of any `TcHook` we hand out, and sending the LoadedSmart
+// across thread boundaries is sound.
+unsafe impl Send for LoadedSmart {}
+
+#[allow(dead_code)] // every method below has its first caller in D5.
+impl LoadedSmart {
+    /// Write the user-configured GOOD-state target rate (byte/s) and
+    /// classification thresholds into `smart_config_map`. The BPF
+    /// cong_control re-reads this on every ACK, so updates take
+    /// effect within ~1 RTT.
+    pub fn set_config(
+        &mut self,
+        rate_bytes_per_sec: u64,
+        loss_lossy_bp: u32,
+        loss_congest_bp: u32,
+        rtt_congest_pct: u32,
+    ) -> Result<()> {
+        // Wire layout matches `struct smart_config` in
+        // accel_smart.bpf.c (24 bytes, native endian — kernel reads in
+        // host byte order; we never serialize across machines):
+        //   __u64 rate;            // bytes 0..8
+        //   __u32 loss_lossy_bp;   //       8..12
+        //   __u32 loss_congest_bp; //      12..16
+        //   __u32 rtt_congest_pct; //      16..20
+        //   __u32 _pad;            //      20..24
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&rate_bytes_per_sec.to_ne_bytes());
+        buf[8..12].copy_from_slice(&loss_lossy_bp.to_ne_bytes());
+        buf[12..16].copy_from_slice(&loss_congest_bp.to_ne_bytes());
+        buf[16..20].copy_from_slice(&rtt_congest_pct.to_ne_bytes());
+
+        let key: u32 = 0;
+        self.skel
+            .maps
+            .smart_config_map
+            .update(&key.to_ne_bytes(), &buf, MapFlags::ANY)
+            .with_context(|| {
+                format!(
+                    "writing smart_config_map (rate={rate_bytes_per_sec} byte/s, \
+                     lossy={loss_lossy_bp}bp, congest={loss_congest_bp}bp, \
+                     rtt_pct={rtt_congest_pct})"
+                )
+            })
+    }
+
+    /// Write the duplicator parameters into `smart_dup_config`. Read
+    /// by the tc-bpf program on every egress packet.
+    pub fn set_dup_config(
+        &mut self,
+        ifindex: u32,
+        port_min: u16,
+        port_max: u16,
+    ) -> Result<()> {
+        // Wire layout matches `struct dup_config` in
+        // accel_smart_dup.bpf.c (8 bytes, native endian):
+        //   __u32 ifindex;   // bytes 0..4
+        //   __u16 port_min;  //       4..6
+        //   __u16 port_max;  //       6..8
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&ifindex.to_ne_bytes());
+        buf[4..6].copy_from_slice(&port_min.to_ne_bytes());
+        buf[6..8].copy_from_slice(&port_max.to_ne_bytes());
+
+        let key: u32 = 0;
+        self.dup_skel
+            .maps
+            .smart_dup_config
+            .update(&key.to_ne_bytes(), &buf, MapFlags::ANY)
+            .with_context(|| {
+                format!(
+                    "writing smart_dup_config (ifindex={ifindex}, \
+                     port_min={port_min}, port_max={port_max})"
+                )
+            })
+    }
+
+    /// Attach the tc-bpf duplicator to `ifindex` egress. Creates the
+    /// underlying clsact qdisc if absent (idempotent — succeeds even
+    /// if a previous accel run left one behind). Stores the resulting
+    /// filter handle so `Drop` can detach cleanly.
+    ///
+    /// Repeated calls are not supported; `attach_tc_egress` should be
+    /// invoked exactly once per `LoadedSmart` lifetime.
+    pub fn attach_tc_egress(&mut self, ifindex: u32) -> Result<()> {
+        use std::os::fd::AsFd;
+
+        let prog_fd = self.dup_skel.progs.smart_dup.as_fd();
+        let mut hook = libbpf_rs::TcHook::new(prog_fd);
+        hook.ifindex(ifindex as i32)
+            .attach_point(libbpf_rs::TC_EGRESS);
+
+        hook.create()
+            .with_context(|| format!("creating tc clsact qdisc on ifindex={ifindex}"))?;
+
+        let attached = hook
+            .attach()
+            .with_context(|| {
+                format!("attaching smart_dup BPF prog to tc/egress on ifindex={ifindex}")
+            })?;
+
+        self.tc_hook = Some(attached);
+        Ok(())
+    }
+
+    /// Total accel_smart-managed sockets currently alive. Bumped in
+    /// smart_init, decremented in smart_release.
+    pub fn socket_count(&self) -> Result<u64> {
+        let key: u32 = 0;
+        let bytes = self
+            .skel
+            .maps
+            .smart_socket_count
+            .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+            .context("looking up smart_socket_count")?
+            .ok_or_else(|| anyhow!("smart_socket_count missing key 0"))?;
+        let arr: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("smart_socket_count value len {} (want 8)", bytes.len()))?;
+        Ok(u64::from_ne_bytes(arr))
+    }
+
+    /// Per-state population: `[GOOD, LOSSY, CONGEST]`. Updated by the
+    /// struct_ops half on each state transition that survives the
+    /// 200ms minimum-dwell hysteresis.
+    pub fn state_counts(&self) -> Result<[u64; 3]> {
+        let mut out = [0u64; 3];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let key: u32 = i as u32;
+            let bytes = self
+                .skel
+                .maps
+                .smart_state_count
+                .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+                .with_context(|| format!("looking up smart_state_count[{i}]"))?
+                .ok_or_else(|| anyhow!("smart_state_count missing key {i}"))?;
+            let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow!(
+                    "smart_state_count[{i}] value len {} (want 8)",
+                    bytes.len()
+                )
+            })?;
+            *slot = u64::from_ne_bytes(arr);
+        }
+        Ok(out)
+    }
 }
 
 /// Type-erased wrapper. Each variant carries the algorithm-specific Skel
@@ -116,6 +317,14 @@ pub struct LoadedSmart {
 /// has unique runtime API (only brutal does, for set_rate/socket_count).
 ///
 /// Variant names mirror the algorithm names without the `accel_` prefix.
+//
+// `large_enum_variant` is allowed because Smart legitimately holds two
+// skeletons + an optional TcHook, while Cubic/Brutal hold one. Boxing
+// would just push the same allocation out of the enum without saving
+// real memory (the HashMap value slot already pays for one Smart-sized
+// allocation when smart is present), and would force an extra deref on
+// every match arm.
+#[allow(clippy::large_enum_variant)]
 pub enum LoadedAlgo {
     /// Cubic has no per-algo runtime API — it's a pure Drop guard.
     /// `dead_code` allow needed because the field is matched-and-ignored
@@ -198,21 +407,34 @@ fn load_brutal() -> Result<LoadedAlgo> {
     Ok(LoadedAlgo::Brutal(LoadedBrutal { _link: link, skel }))
 }
 
-/// D2-minimal smart loader. Mirrors load_brutal's structure but without
-/// any per-algo runtime methods on the returned LoadedSmart — D4 will
-/// extend this with map handles for set_config / socket_count /
-/// state_counts. The whole point at D2 is to drive accel_smart through
-/// the same libbpf-rs → kernel-verifier path the production loader will
-/// use, isolating the verifier risk before any cli/status/health/config
-/// integration lands.
+/// Load and register both halves of accel_smart:
+///
+/// * the struct_ops half (cong_control on every ACK, writes
+///   smart_link_state from the per-socket state machine), and
+/// * the tc-bpf egress half (reads smart_link_state, clones outbound
+///   TCP packets when LOSSY).
+///
+/// The two BPF objects share the smart_link_state map kernel-side via
+/// `reuse_fd`: dup's open-skeleton entry is rebound to smart's loaded
+/// map fd before dup is loaded, so both halves point at one and the
+/// same single-entry ARRAY map.
+///
+/// The tc filter is NOT attached here — `attach_tc_egress(ifindex)`
+/// is called separately by cli (D5) once the user-configured network
+/// interface has been resolved. This keeps `load_smart()` callable
+/// from the registry without requiring a `[smart]` section in
+/// acc.conf when smart isn't the active algorithm.
 fn load_smart() -> Result<LoadedAlgo> {
-    let storage: &'static mut MaybeUninit<OpenObject> =
+    use std::os::fd::AsFd;
+
+    // 1. Smart struct_ops half.
+    let smart_storage: &'static mut MaybeUninit<OpenObject> =
         Box::leak(Box::new(MaybeUninit::uninit()));
-    let skel_builder = AccelSmartSkelBuilder::default();
-    let open_skel = skel_builder
-        .open(storage)
+    let smart_builder = AccelSmartSkelBuilder::default();
+    let open_smart = smart_builder
+        .open(smart_storage)
         .context("opening accel_smart skeleton failed")?;
-    let mut skel = open_skel.load().context(
+    let mut skel = open_smart.load().context(
         "loading accel_smart into kernel failed — \
          struct_ops.link requires Linux 6.4+ with CONFIG_DEBUG_INFO_BTF=y",
     )?;
@@ -221,9 +443,36 @@ fn load_smart() -> Result<LoadedAlgo> {
         .accel_smart
         .attach_struct_ops()
         .context("registering accel_smart struct_ops failed (check `dmesg | tail`)")?;
+
+    // 2. Smart-dup tc-bpf half. Open the skeleton, alias the
+    //    smart_link_state map onto smart's loaded fd, then load —
+    //    without the reuse_fd step the two skeletons would each
+    //    create their own unrelated single-entry ARRAY map.
+    let dup_storage: &'static mut MaybeUninit<OpenObject> =
+        Box::leak(Box::new(MaybeUninit::uninit()));
+    let dup_builder = AccelSmartDupSkelBuilder::default();
+    let mut open_dup = dup_builder
+        .open(dup_storage)
+        .context("opening accel_smart_dup skeleton failed")?;
+
+    let state_fd = skel.maps.smart_link_state.as_fd();
+    open_dup
+        .maps
+        .smart_link_state
+        .reuse_fd(state_fd)
+        .context("reuse_fd smart_link_state into accel_smart_dup")?;
+
+    let dup_skel = open_dup.load().context(
+        "loading accel_smart_dup into kernel failed — \
+         tc-bpf egress requires CAP_NET_ADMIN and a recent enough kernel \
+         (CONFIG_NET_CLS_BPF=y, CONFIG_NET_SCH_INGRESS=y for clsact)",
+    )?;
+
     Ok(LoadedAlgo::Smart(LoadedSmart {
+        tc_hook: None,
         _link: link,
-        _skel: skel,
+        dup_skel,
+        skel,
     }))
 }
 
