@@ -95,6 +95,49 @@ mv acc.conf.example acc.conf
 vim acc.conf      # 选 algorithm + 设 brutal rate_mbps (如选 brutal)
 ```
 
+### 2.5-D6 验收 (集成测试: 三种状态 + 热切换)
+
+```bash
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/verify-smart-d6.sh
+chmod +x verify-smart-d6.sh
+
+# 需要 iperf3:
+sudo apt install -y iperf3
+
+# 跑 D6 验收 (~90 秒, eth0/SSH 完全不动):
+sudo ./verify-smart-d6.sh
+```
+
+D6 通过 **network namespace + veth pair** 隔离测试流量,绝对不动 eth0:
+
+```
+host netns                     accv0 ──veth── accv1   netns "accel-test"
+  iperf3 -c                    │                       │
+  accel sysctl=accel_smart     │ tc clsact (BPF 克隆) │
+  acc.conf [smart].interface   │ tc root (netem)      │
+    = "accv0"                  │                       │
+                                                       └── iperf3 -s
+```
+
+测试三个状态 (每段 20 秒, 中间 6 秒采样):
+
+| 阶段 | netem 设置 | 期望状态 | 期望 TX 包数 |
+|---|---|---|---|
+| GOOD | 无 | GOOD | 基线 |
+| LOSSY | `loss 5%` | LOSSY | ≥ 1.3 × 基线 (BPF 克隆每包发 2 份) |
+| CONGEST | `loss 20% delay 200ms` | CONGEST | 较低 (BDP 收敛 + drain) |
+
+外加热切换测试: smart → cubic → brutal → smart, 验证 sysctl 跟着变。
+
+**关键设计**: clsact 在 root qdisc 之前跑,所以 BPF 先克隆,netem 后随机
+丢包/延迟。每个克隆独立丢包概率,真正能验证冗余补偿效果。
+
+失败时 (⚠ 警告) 多半是 EWMA 窗口或采样时机问题,**重跑可能 fix**。
+真正失败 (✗) 才需要定位代码,完整输出贴给架构师。
+
+清理: 脚本退出时自动 trap cleanup (kill accel + 删 netns + 删 veth +
+恢复原 acc.conf)。即使 ctrl+c 也安全。手动清理: `sudo ./verify-smart-d6.sh clean`。
+
 ### 2.5-D5 验收 (端到端接通: 配置 → tc attach → status)
 
 ```bash
