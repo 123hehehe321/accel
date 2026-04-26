@@ -34,8 +34,14 @@ mod accel_brutal_skel {
     include!(concat!(env!("OUT_DIR"), "/accel_brutal.skel.rs"));
 }
 
+#[allow(dead_code, unused_imports, clippy::all)]
+mod accel_smart_skel {
+    include!(concat!(env!("OUT_DIR"), "/accel_smart.skel.rs"));
+}
+
 use accel_brutal_skel::{AccelBrutalSkel, AccelBrutalSkelBuilder};
 use accel_cubic_skel::{AccelCubicSkel, AccelCubicSkelBuilder};
+use accel_smart_skel::{AccelSmartSkel, AccelSmartSkelBuilder};
 
 /// Per-algorithm Skel + Link bundle for the cubic baseline. Dropping it
 /// unregisters the struct_ops via Link::drop; closing all map fds via
@@ -96,6 +102,15 @@ impl LoadedBrutal {
     }
 }
 
+/// Drop guard for accel_smart. D2 ships only the loader plumbing — D4
+/// will extend with set_config / socket_count / state_counts methods.
+/// At D2 the variant exists purely to put the kernel verifier through
+/// its paces at accel startup; no runtime API is consumed yet.
+pub struct LoadedSmart {
+    _link: Link,
+    _skel: AccelSmartSkel<'static>,
+}
+
 /// Type-erased wrapper. Each variant carries the algorithm-specific Skel
 /// and any extra map handles. Match on the variant when an algorithm
 /// has unique runtime API (only brutal does, for set_rate/socket_count).
@@ -108,6 +123,10 @@ pub enum LoadedAlgo {
     #[allow(dead_code)]
     Cubic(LoadedCubic),
     Brutal(LoadedBrutal),
+    /// Smart's runtime API (D4) is not wired in D2; the variant body is
+    /// only a Drop guard at this stage.
+    #[allow(dead_code)]
+    Smart(LoadedSmart),
 }
 
 /// Registry. Adding a new algorithm here is the only place outside its
@@ -118,6 +137,7 @@ pub fn all_loaders() -> &'static [(&'static str, LoaderFn)] {
     &[
         ("accel_cubic", load_cubic),
         ("accel_brutal", load_brutal),
+        ("accel_smart", load_smart),
     ]
 }
 
@@ -178,11 +198,41 @@ fn load_brutal() -> Result<LoadedAlgo> {
     Ok(LoadedAlgo::Brutal(LoadedBrutal { _link: link, skel }))
 }
 
+/// D2-minimal smart loader. Mirrors load_brutal's structure but without
+/// any per-algo runtime methods on the returned LoadedSmart — D4 will
+/// extend this with map handles for set_config / socket_count /
+/// state_counts. The whole point at D2 is to drive accel_smart through
+/// the same libbpf-rs → kernel-verifier path the production loader will
+/// use, isolating the verifier risk before any cli/status/health/config
+/// integration lands.
+fn load_smart() -> Result<LoadedAlgo> {
+    let storage: &'static mut MaybeUninit<OpenObject> =
+        Box::leak(Box::new(MaybeUninit::uninit()));
+    let skel_builder = AccelSmartSkelBuilder::default();
+    let open_skel = skel_builder
+        .open(storage)
+        .context("opening accel_smart skeleton failed")?;
+    let mut skel = open_skel.load().context(
+        "loading accel_smart into kernel failed — \
+         struct_ops.link requires Linux 6.4+ with CONFIG_DEBUG_INFO_BTF=y",
+    )?;
+    let link = skel
+        .maps
+        .accel_smart
+        .attach_struct_ops()
+        .context("registering accel_smart struct_ops failed (check `dmesg | tail`)")?;
+    Ok(LoadedAlgo::Smart(LoadedSmart {
+        _link: link,
+        _skel: skel,
+    }))
+}
+
 /// Build-time probe printed during startup banner — confirms both
 /// skeletons are embedded in the binary even before any kernel load.
 pub fn skeleton_info() -> String {
     format!(
-        "skeletons embedded: accel_cubic, accel_brutal (target {}, libbpf-rs {})",
+        "skeletons embedded: accel_cubic, accel_brutal, accel_smart \
+         (target {}, libbpf-rs {})",
         std::env::consts::ARCH,
         libbpf_version(),
     )

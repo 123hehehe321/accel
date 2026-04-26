@@ -177,7 +177,7 @@ fn run_server() -> Result<()> {
             .expect("just verified loaded")
         {
             LoadedAlgo::Brutal(b) => b.set_rate(rate_bytes)?,
-            LoadedAlgo::Cubic(_) => unreachable!(
+            LoadedAlgo::Cubic(_) | LoadedAlgo::Smart(_) => unreachable!(
                 "accel_brutal name must map to LoadedAlgo::Brutal by ebpf_loader construction"
             ),
         }
