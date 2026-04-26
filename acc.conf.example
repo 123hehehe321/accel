@@ -21,6 +21,7 @@
 # 可选值:
 #   accel_cubic   稳定基线 (BPF CUBIC 移植)
 #   accel_brutal  跨境高丢包场景的激进算法 (需要 [brutal] 段)
+#   accel_smart   2.5 自适应算法 (需要 [smart] 段)
 #
 # 启动时算法加载失败 → 程序退出 (不静默降级)。
 algorithm = "accel_cubic"
@@ -34,6 +35,35 @@ algorithm = "accel_cubic"
 # 选 brutal 时取消下面两行的注释:
 #[brutal]
 #rate_mbps = 100
+
+
+# ─── 仅当 algorithm = "accel_smart" 时必填 ──────────────────
+# accel_smart 是状态自适应算法: 自动在 GOOD / LOSSY / CONGEST
+# 三种链路状态间切换。每种状态用不同策略 (见 README §9.x)。
+#
+# 必填项:
+#   rate_mbps    GOOD 状态下的单连接速率上限 (Mbps)。范围 1..=100000。
+#   interface    挂 tc-bpf 多倍发包程序的网卡名 (用 `ip link` 查看)。
+#                通常是默认路由出口网卡 (eth0 / ens3 / 等)。
+#                找不到对应网卡 → 启动失败 (不静默降级)。
+#
+# 可选项 (有合理默认值):
+#   duplicate_ports  多倍发包的 dport 范围, "min-max" 格式。
+#                    "" 或省略 = 不过滤 (LOSSY 状态下所有 TCP 端口都克隆)。
+#                    强烈建议填: 仅克隆业务端口, 让 SSH/DNS 等管理流量
+#                    不受 LOSSY 状态多倍发包影响。
+#   loss_lossy_bp    丢包率 ≥ 此值 (basis points; 100 = 1%) → LOSSY 状态。默认 100。
+#   loss_congest_bp  丢包率 ≥ 此值 → CONGEST 状态 (主动让路)。默认 1500 = 15%。
+#   rtt_congest_pct  RTT 膨胀 ≥ 此百分比 → CONGEST 状态。默认 50 (= srtt/min_rtt ≥ 1.5)。
+#
+# 选 smart 时取消下面整段的注释,根据需要调:
+#[smart]
+#rate_mbps = 100
+#interface = "eth0"
+#duplicate_ports = "5500-20000"
+#loss_lossy_bp = 100
+#loss_congest_bp = 1500
+#rtt_congest_pct = 50
 
 
 # ─── runtime ─────────────────────────────────────────────────

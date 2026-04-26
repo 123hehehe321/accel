@@ -2,26 +2,70 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D5 (glibc 2.34 build)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build)
 
-- **2.5-D5 阶段**: cli/status/health 接通 — `algorithm = "accel_smart"`
-  端到端可用。启动时 cli.rs 解析 `[smart]` 段、写两个 BPF 配置 map、
-  attach tc-bpf 到 egress；`./accel status` 多了 smart 段；
-  health.rs 在外部 unregister 后能自愈重写 smart 配置 + 重 attach tc。
-- **D5 验收脚本** `verify-smart-d5.sh`:
-  * 负向测试: target=smart 但缺 [smart] 段 → 必须 bail
-  * 正向测试: 启动日志含 "smart config / thresholds / dup ports / tc-bpf attached"
-  * tc 真挂上: `tc filter show dev <iface> egress` 含 smart_dup
-  * status 输出含 smart rate / thresholds / interface / sockets / state
-  * stop 后 tc filter 干净卸载
-- **accel binary 更新**: 完整接通后体积从 1.27 MB → 1.29 MB。
+- **2.5-D7 阶段**: 生产部署 + 长跑观察。所有 Rust 接通和 BPF 程序都在
+  D5/D6 已验收完成,**剩下只能跑真业务流量看实际行为**。
+- **新增源码**:
+  * `cli.rs::preflight()` — 启动时检查内核 ≥ 6.4 + BTF 存在,
+    失败 bail 中文修复提示 (~35 行,无新子命令,符合"简单粗暴"原则)
+  * LOSSY 升级:reno 加法增长 → BDP 估算 + 100% pacing
+    (D6 暴露 reno 切换时 cwnd 慢爬,吞吐暴跌几分钟的问题)
+  * `acc.conf.example` 加完整 `[smart]` 段示例 + 详细中文注释
+- **新增工具**:
+  * `d7-monitor.sh` — 部署 + 观察助手:
+    md5 校验 → acc.conf 审查 → 启动 accel → T0 / T1(+5m) / T2(+1h)
+    三个时间点抓 `./accel status` 快照 → 子命令 `snapshot` /
+    `rollback` / `diag`
 - **未变**: 2.3 的 cubic / brutal 行为完全不动。
+
+### D7 部署快速开始
+
+```bash
+# 拉新版 binary + 配置示例 + 监控脚本
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/accel
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/acc.conf.example
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/d7-monitor.sh
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/d7-monitor.expected.md5
+chmod +x accel d7-monitor.sh
+
+# 配 acc.conf (按 acc.conf.example 里的 [smart] 段填):
+mv acc.conf.example acc.conf
+vim acc.conf
+# 改: algorithm = "accel_smart", [smart] 段填 rate_mbps + interface
+#     + duplicate_ports (强烈建议填业务端口,别让 SSH 也被克隆)
+
+# 部署 + T0/T1/T2 快照 (~65 分钟)
+sudo ./d7-monitor.sh
+
+# 24 小时后再抓一个快照
+sudo ./d7-monitor.sh snapshot
+
+# 异常时一键回滚到 brutal
+sudo ./d7-monitor.sh rollback
+```
+
+监控关注:
+- `smart sockets:` 占 `total tcp:` 的比例(0 = 流量没进 smart)
+- `smart state:` 三态分布合理性(常年 100% CONGEST 或 0% LOSSY 都可疑)
+- `accel-incidents.log` 不该有 KernelPanic / OomKilled
+- 业务体感(SSH / haproxy / nginx / v2ray 是否比 brutal 顺)
+
+## 历史版本: 2.5-smart-D6 (集成测试)
+
+- D6 用 netns + veth + netem 在零 SSH 风险下跑三状态 + 热切换;
+  GOOD/CONGEST 分类 OK,LOSSY 在 veth 测不出(零 RTT 扭曲,详见
+  README.md §12.11)。`verify-smart-d6.sh` 仍可用。
+
+## 历史版本: 2.5-smart-D5 (端到端接通)
+
+- D5 完成 Rust 端 cli/status/health 全接通,`verify-smart-d5.sh`
+  仍可用作回归。
 
 ## 历史版本: 2.5-smart-D4 (kernel-side 验收)
 
-- D4 阶段只 load tc-bpf 程序进 kernel 但不 attach 到 egress hook;
-  验证 reuse_fd 共享 smart_link_state map。`verify-smart-d4.sh` 仍可用
-  作回归测试。
+- D4 阶段验证 reuse_fd 共享 smart_link_state map; tc-bpf 程序入 kernel
+  但不 attach (D5 才接 attach)。`verify-smart-d4.sh` 仍可用作回归。
 
 ## 历史版本: 2.5-smart-D2 path A (glibc 2.34 build)
 
@@ -296,7 +340,8 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `8d332b9353d036fe044f885935495e51`
-- **accel 大小**: 1,290,912 字节
+- **accel MD5**: `859b70f1956a8bfa913d9f6d374f28e4`
+- **accel 大小**: 1,300,704 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
+- **新增**: preflight 启动检查 + LOSSY BDP+pacing 升级
