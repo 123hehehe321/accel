@@ -2,7 +2,21 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.3-D4 (glibc 2.34 build)
+## 当前版本: 2.5-smart-D2 (glibc 2.34 build)
+
+- **2.5-D2 阶段**: accel_smart 算法的 BPF 程序进入仓库,用 bpftool 直接
+  跑 verifier 验收 (Rust 端集成在 D4 完成,所以这一步只测 kernel 是否
+  接受 BPF 程序)。
+- **新增文件**:
+  * `accel_smart.bpf.o` — 独立编译的 accel_smart struct_ops 对象 (clang
+    编, glibc 无关), 用 `bpftool struct_ops register` 加载。
+  * `verify-smart-d2.sh` — D2 验收脚本: md5 校验 → bpftool 注册 → 出错
+    抓 dmesg → 通过则确认 sysctl 可见。
+- **accel binary 也更新**: 内嵌 accel_smart skeleton (D4 才用), 当前
+  启动行为和 2.3 相同 (只加载 accel_cubic + accel_brutal)。
+- **未变**: 2.3 的 cubic / brutal 行为完全不动。
+
+## 历史版本: 2.3-D4 (glibc 2.34 build)
 
 - **2.3 阶段**: 多算法并存架构 + accel_brutal 算法首次进入 binary
 - **新增 (相对 2.1-D6.1)**:
@@ -54,6 +68,20 @@ chmod +x accel verify-2.3.sh
 mv acc.conf.example acc.conf
 vim acc.conf      # 选 algorithm + 设 brutal rate_mbps (如选 brutal)
 ```
+
+### 2.5-D2 额外下载 (verifier 验收)
+
+```bash
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/accel_smart.bpf.o
+curl -LO https://github.com/123hehehe321/accel/raw/binaries/verify-smart-d2.sh
+chmod +x verify-smart-d2.sh
+
+# 跑 D2 验收 (kernel 6.4+, 必须 BTF):
+sudo ./verify-smart-d2.sh
+```
+
+期望全程 PASS。失败时脚本会自动打印 dmesg 切片 (verifier 日志), 把
+完整输出贴给架构师 — 不要本地改 BPF 代码 (PROJECT_CONTEXT §5.4)。
 
 ## 启动 (cubic 默认)
 
@@ -137,7 +165,9 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **MD5**: `2881adbe808ea457f4a049b28b5b6cc3`
-- **大小**: 1,193,976 字节 (1.19 MB)
+- **accel MD5**: `cf91f3d4ebe1fbb74da502ae45baf1b3`
+- **accel 大小**: 1,194,616 字节
+- **accel_smart.bpf.o MD5**: `b53402bd9e08d16b19265f4b5a81cd63`
+- **accel_smart.bpf.o 大小**: 505,976 字节
 - **glibc 底线**: GLIBC_2.34
-- **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1
+- **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
