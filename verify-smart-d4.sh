@@ -43,18 +43,31 @@ require_root() {
     fi
 }
 
-# Count BPF objects matching a label substring. We keep the parsing
-# tolerant of bpftool's slightly-different output across versions:
-# both v7.1 ("123: cgroup_skb  name foo") and v7.4 work the same way
-# under our grep-by-name.
+# Count BPF objects whose `name` field starts with the given prefix.
+#
+# IMPORTANT: the kernel BPF object-name field is BPF_OBJ_NAME_LEN = 16
+# bytes including the trailing NUL, leaving 15 usable characters.
+# libbpf truncates any longer name on load, and bpftool prints the
+# truncated form. So a script that searches for the full source-level
+# name will miss long maps:
+#
+#   "smart_link_state" (16 chars in C)  →  kernel stores "smart_link_stat"
+#   "smart_dup_config" (16 chars in C)  →  kernel stores "smart_dup_confi"
+#
+# A 15-char prefix (or shorter) covers both possibilities. Pass the
+# prefix you actually want to match — e.g. `map_count smart_link_sta`
+# matches both the truncated and the full form, while still being
+# specific enough to not collide with `smart_link_*` siblings.
 prog_count() {
-    local name="$1"
-    bpftool prog show 2>/dev/null | awk -v n="$name" '$0 ~ "name " n " "  { c++ } END { print c+0 }'
+    local prefix="$1"
+    bpftool prog show 2>/dev/null \
+        | awk -v p="$prefix" '$0 ~ ("name " p) { c++ } END { print c+0 }'
 }
 
 map_count() {
-    local name="$1"
-    bpftool map show 2>/dev/null | awk -v n="$name" '$0 ~ "name " n " " { c++ } END { print c+0 }'
+    local prefix="$1"
+    bpftool map show 2>/dev/null \
+        | awk -v p="$prefix" '$0 ~ ("name " p) { c++ } END { print c+0 }'
 }
 
 cmd_diag() {
@@ -199,19 +212,33 @@ CONF
     fi
 
     local link_state_maps
-    link_state_maps=$(map_count smart_link_state)
+    # 14-char prefix — matches the kernel-truncated form (smart_link_stat,
+    # 15 chars) AND the C-source form (smart_link_state, 16 chars) without
+    # colliding with any sibling smart_* map. See map_count comment.
+    link_state_maps=$(map_count smart_link_sta)
     if [ "$link_state_maps" -eq 1 ]; then
         echo "  ✓ smart_link_state map count=1 (reuse_fd worked)"
+        bpftool map show 2>/dev/null \
+            | awk '/name smart_link_sta/{print "    " $0}' | head -3
     elif [ "$link_state_maps" -eq 2 ]; then
         echo "  ✗ smart_link_state map count=2 — reuse_fd FAILED" >&2
         echo "    (struct_ops + tc-bpf each created their own map; they're" >&2
         echo "     decoupled, so LOSSY signals would never reach the dup prog)" >&2
-        bpftool map show 2>/dev/null | grep smart_link_state
+        bpftool map show 2>/dev/null | grep "name smart_link_sta"
         cmd_stop
         exit 1
     else
-        echo "  ⚠ smart_link_state map count=$link_state_maps (unexpected)"
-        bpftool map show 2>/dev/null | grep smart_link_state || true
+        # count=0 was the false-negative we hit before the prefix fix.
+        # If we still see 0 here, accel really didn't create the map —
+        # dump every smart_* map plus the load warnings to debug.
+        echo "  ✗ smart_link_state map count=$link_state_maps — unexpected" >&2
+        echo "  --- runtime smart_* maps in kernel ---"
+        bpftool map show 2>/dev/null | grep -E "name smart_" || \
+            echo "    (none found)"
+        echo "  --- accel log warnings ---"
+        grep -E "warning:" /tmp/accel-d4.log | head -10 || true
+        cmd_stop
+        exit 1
     fi
 
     # struct_ops registration sanity (regression: same as D2)
@@ -230,7 +257,7 @@ CONF
     local i=0
     while [ "$i" -lt 8 ]; do
         if [ "$(prog_count smart_dup)" -eq 0 ] && \
-           [ "$(map_count smart_link_state)" -eq 0 ]; then
+           [ "$(map_count smart_link_sta)" -eq 0 ]; then
             break
         fi
         sleep 1
@@ -239,7 +266,7 @@ CONF
 
     local final_progs final_maps
     final_progs=$(prog_count smart_dup)
-    final_maps=$(map_count smart_link_state)
+    final_maps=$(map_count smart_link_sta)
     if [ "$final_progs" -eq 0 ] && [ "$final_maps" -eq 0 ]; then
         echo "  ✓ smart_dup + smart_link_state cleaned up"
     else
