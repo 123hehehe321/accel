@@ -291,24 +291,50 @@ static __always_inline void smart_apply_good(struct sock *sk,
 	sk->sk_pacing_rate = max_pace ? min_t(__u64, rate, max_pace) : rate;
 }
 
-/* ─── Behaviour: LOSSY (reno-style additive increase) ─────────────────── */
+/* ─── Behaviour: LOSSY (BDP estimate + 100% pacing) ───────────────────── */
 
-static __always_inline void smart_apply_lossy(struct tcp_sock *tp,
+static __always_inline void smart_apply_lossy(struct sock *sk,
+					      struct tcp_sock *tp,
 					      const struct rate_sample *rs)
 {
-	/* No-loss window: cwnd += acked_sacked / cwnd (≈ +1 per RTT).
-	 * Loss is left to the kernel's ssthresh / recovery machinery —
-	 * we deliberately do not touch cwnd on losses here. tc-bpf egress
-	 * compensates by cloning packets at the LOSSY threshold. */
-	if (rs->losses == 0 && rs->acked_sacked > 0 && tp->snd_cwnd > 0) {
-		__u32 incr = (__u32)rs->acked_sacked / tp->snd_cwnd;
-		if (incr < 1)
-			incr = 1;
-		tp->snd_cwnd = min_t(__u32,
-				     tp->snd_cwnd + incr,
-				     tp->snd_cwnd_clamp);
+	/* Set cwnd from observed delivery rate (BDP) and pace at 100% of
+	 * that rate. Deliberately neither brutal-style fixed-rate (which
+	 * would stack 2× tc-bpf clones × full rate = link-busting) nor
+	 * reno additive-increase (post-GOOD→LOSSY transition the cwnd
+	 * crawl takes minutes — throughput collapses). The tc-bpf egress
+	 * duplicator handles noise loss compensation in parallel.
+	 *
+	 * Difference vs CONGEST (smart_apply_congest):
+	 *   LOSSY    cwnd = BDP             (free to grow with bw)
+	 *            pacing = 100% bw       (track the link)
+	 *   CONGEST  cwnd = min(cwnd, BDP)  (only shrinks)
+	 *            pacing = 50% drain → 90% cruise
+	 */
+	__u64 bw = 0;
+	if (rs->interval_us > 0 && rs->delivered > 0)
+		bw = (__u64)rs->delivered * tp->mss_cache * USEC_PER_SEC
+			/ (__u64)rs->interval_us;
+
+	__u32 min_rtt = tcp_min_rtt_us(tp);
+
+	if (bw > 0 && min_rtt > 0) {
+		__u64 bdp = bw * min_rtt / USEC_PER_SEC;
+		__u32 mss = tp->mss_cache;
+		if (mss == 0)
+			mss = 1; /* defensive; shouldn't happen post-handshake */
+
+		__u32 target = (__u32)(bdp / mss);
+		if (target < 4)
+			target = 4;
+
+		tp->snd_cwnd = min_t(__u32, target, tp->snd_cwnd_clamp);
+
+		__u64 max_pace = sk->sk_max_pacing_rate;
+		sk->sk_pacing_rate =
+			max_pace ? min_t(__u64, bw, max_pace) : bw;
 	}
-	/* Pacing: do not set sk_pacing_rate; let kernel default. */
+	/* If we can't estimate (interval/delivered/min_rtt zero), leave
+	 * cwnd and pacing untouched — kernel defaults take over. */
 }
 
 /* ─── Behaviour: CONGEST (BDP convergence + drain + cruise) ───────────── */
@@ -475,7 +501,7 @@ __u32 BPF_PROG(smart_main, struct sock *sk, __u32 ack, int flag,
 	if (p->state == LINK_GOOD) {
 		smart_apply_good(sk, tp, cfg->rate, acked_total, losses_total);
 	} else if (p->state == LINK_LOSSY) {
-		smart_apply_lossy(tp, rs);
+		smart_apply_lossy(sk, tp, rs);
 	} else { /* LINK_CONGEST */
 		smart_apply_congest(sk, tp, p, rs);
 	}
