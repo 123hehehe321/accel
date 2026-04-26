@@ -89,6 +89,8 @@ fn run_server() -> Result<()> {
     println!("hello accel (v0.2, 2.3-D3)");
     println!();
 
+    preflight()?;
+
     let cfg = config::load(Path::new(CONFIG_PATH))?;
 
     println!("config loaded from: {CONFIG_PATH}");
@@ -413,6 +415,55 @@ fn capture_cc_with_fallback(
         }
     }
     Some("cubic".to_string())
+}
+
+/// Pre-flight environment check. Runs before any kernel side-effect.
+///
+/// Catches the two failure modes that produce inscrutable libbpf errors:
+///   1. Kernel < 6.4 (struct_ops.link not supported)
+///   2. /sys/kernel/btf/vmlinux missing (CO-RE relocations impossible)
+///
+/// Other potential failures (no CAP_NET_ADMIN, JIT disabled, clsact
+/// already owned, missing CONFIG_NET_CLS_BPF) bubble up as libbpf
+/// errors with reasonably clear messages, so we don't add a check
+/// for each — the maintenance cost outweighs the UX gain.
+fn preflight() -> Result<()> {
+    // Kernel version. /proc/sys/kernel/osrelease is the canonical source
+    // (uname(2) reads it). Format: "6.12.74+deb12-amd64" — only the first
+    // two integers ("6.12") are needed.
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .context("reading /proc/sys/kernel/osrelease")?;
+    let release = release.trim();
+    let mut parts = release.split('.');
+    let major: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("cannot parse kernel major from {release:?}"))?;
+    let minor: u32 = parts
+        .next()
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("cannot parse kernel minor from {release:?}"))?;
+    let kver = (major, minor);
+    if kver < (6, 4) {
+        bail!(
+            "preflight: 内核版本 {release} 不支持 struct_ops.link (需要 ≥ 6.4)\n  \
+             Debian 12 修复: sudo apt install -t bookworm-backports linux-image-amd64 + reboot\n  \
+             Debian 13: 默认内核已满足 (6.12+)"
+        );
+    }
+
+    // BTF must be present for CO-RE. CONFIG_DEBUG_INFO_BTF=y enables this.
+    if !Path::new("/sys/kernel/btf/vmlinux").exists() {
+        bail!(
+            "preflight: /sys/kernel/btf/vmlinux 不存在 (需要 CONFIG_DEBUG_INFO_BTF=y)\n  \
+             绝大多数 Debian/Ubuntu 默认/backports 内核都启用; 若缺失多半是自编内核或精简发行版.\n  \
+             需重装支持 BTF 的内核包."
+        );
+    }
+
+    println!("preflight: kernel {release}, BTF present ✓");
+    Ok(())
 }
 
 /// Resolve a network interface name (e.g. "eth0") to its kernel

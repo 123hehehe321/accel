@@ -4,15 +4,16 @@
 
 ---
 
-## 1. 项目当前状态(2026-04-25)
+## 1. 项目当前状态(2026-04-26)
 
-- **版本**:v0.2 / 2.3 收官
-- **main 收尾 commit**:`78b7680`
-- **binaries 收尾 commit**:`7617cf8`
-- **binary md5**:`f14594ac59d737df516a0dd32dacf8b3`
-- **代码量**:2450 行 / 2500 预算(98%,健康)
-- **支持算法**:`accel_cubic`(基线) + `accel_brutal`(激进)
-- **下一阶段**:**2.4 未启动,等用户实际使用反馈**
+- **版本**:v0.2 / **2.5 D1-D7 完成,等用户实际跨境流量反馈**
+- **支持算法**:`accel_cubic`(基线) + `accel_brutal`(激进) + **`accel_smart`(2.5 新增,自适应)**
+- **代码量**:~3700 行 / 3000 预算(用户拍板放宽,2.6+ 严控)
+- **2.5 收尾源 commit**:`claude/accel-smart` 上的 preflight commit(待最终编号)
+- **2.5 收尾 binaries commit**:见 binaries 分支 README
+
+历史里程碑:
+- 2.3 收官 commit: main `78b7680` / binaries `7617cf8` / binary md5 `f14594ac59d737df516a0dd32dacf8b3`
 
 ---
 
@@ -142,6 +143,55 @@ BPF map 读写必须用 `to_ne_bytes` / `from_ne_bytes` 显式声明。不要假
 
 例子:`MIN_ACK_RATE_PERCENT = 80`。**只要源码里 grep 到这一行,就证明算法行为对**。VPS 用 tc netem 模拟丢包测试**风险大**(影响 SSH、影响所有出网),**不值得**。
 
+### 5.9 系统 bpftool 版本和 libbpf 不同步
+
+VPS 系统 bpftool 装的版本可能落后 libbpf-rs 内嵌的 libbpf。例如 Debian 12 backports
+的 bpftool v7.1 用的是 libbpf 1.1,**不认识 `.struct_ops.link` ELF section**(libbpf 1.2+ 才支持)。
+直接 `bpftool struct_ops register file.bpf.o` 会静默 skip 这个 section 然后报 -ENOTSUPP,
+verifier 一条指令都没跑过。
+
+**规则**:
+- 测 struct_ops verifier 不要走系统 bpftool,走 accel binary(内嵌 libbpf-rs 0.26.2 / libbpf 1.4+)
+- 看到 `processed 0 insns` 配合 `skipping unrecognized data section .struct_ops.link` 立即想到这是工具版本问题,不是 BPF 代码问题
+
+### 5.10 BPF 对象名字 16 字节限制(含 NUL)
+
+内核 `BPF_OBJ_NAME_LEN = 16` 包含末尾 null 终止符,**实际可用 15 字符**。源码里 16 字符的名字会被
+kernel 截断,bpftool 输出的也是截断后的名字。例如:
+
+  `smart_link_state` (16 chars) → kernel 存 `smart_link_stat` (15 chars)
+  `smart_dup_config` (16 chars) → kernel 存 `smart_dup_confi`
+
+**规则**:写 bpftool 解析脚本时,匹配 ≤ 14 字符的前缀(如 `smart_link_sta`),覆盖
+"截断 + 完整"两种形态。否则 grep 完整名永远找不到 → 误判 reuse_fd 失败。
+
+### 5.11 veth 零 RTT 环境扭曲 LOSSY 分类
+
+D6 集成测试用 netns + veth,baseline RTT ≈ 50µs。施加 5% 丢包时,任何包丢失会触发
+TCP RTO(最小 200ms),srtt 飙到 ~100ms。`srtt/min_rtt = 100ms / 50µs ≈ 2000×`,远超
+50% 阈值 → 直接被分类成 CONGEST,**绕过 LOSSY**。
+
+**规则**:LOSSY 状态在 veth 环境天然测不出来,需要真链路(100ms+ baseline RTT)。
+D6 的 LOSSY 分支验证只是测试基础设施完整性,真实 LOSSY 分类必须在 D7 真业务环境观察。
+
+### 5.12 LOSSY 不能用 reno 加法增长
+
+D6 实测:GOOD→LOSSY 切换后,reno 加法 (`cwnd += acked_sacked / cwnd ≈ +1/RTT`) 太慢,
+cwnd 从初始低位爬升需要几分钟。期间吞吐暴跌(8 Gbps → 49 Mbps)。
+
+**规则**:LOSSY 分支用 BDP 估算 + 100% pacing。LOSSY 和 CONGEST 都用 BDP,但区别:
+- LOSSY:`cwnd = BDP`(可升可降,跟随带宽);pacing = 100% bw
+- CONGEST:`cwnd = min(cwnd, BDP)`(只降不升,主动让路);pacing = 50% drain → 90% cruise
+
+### 5.13 preflight 检查只覆盖硬故障,不做完整 doctor
+
+环境检查机制设计权衡过(2.5-D7 阶段):全功能 `./accel doctor` 子命令是过度设计 ——
+低发现率(用户记不住有这个命令)+ 维护成本(独立检查路径要和实际启动同步)+
+代码量(200-300 行)。最终方案:`run_server()` 第一行调内联 `preflight()`,只检查
+两个硬故障(内核 ≥ 6.4 + BTF 存在),失败 bail 中文修复提示。30 行实现。
+
+**规则**:UX 改进要满足"高发现率 × 高使用频率 × 短代码"。不满足任意一项就考虑"是不是过度设计"。
+
 ---
 
 ## 6. 已知项目特征(非 bug)
@@ -169,13 +219,40 @@ accel 收 SIGHUP 死掉(2.3 未处理 systemd 集成)。建议 `nohup ./accel &`
 | **2.1** | accel_cubic 基线 + Bug 1/2 | main `adaf625` / binary `acc28784...` |
 | **2.2 BBR** | 探索后放弃(用户洞察:用户可直接 sysctl bbr,不值得做)| WIP `7133987`(历史保留) |
 | **2.3 brutal** | 自写 BPF struct_ops,5 轮 verifier 撞坑修复 | main `78b7680` / binary `f14594ac...` |
-| **2.4+** | **未启动**,等用户实际使用反馈 | - |
+| **2.5 smart** | 自适应算法 + tc-bpf 多倍发包,D1-D7 完成 | claude/accel-smart 分支 |
+| **2.6+** | **未启动**,等 2.5 真业务流量反馈 | - |
+
+### 2.5 smart 阶段细分
+
+| D 阶段 | 内容 | 关键 commit |
+|---|---|---|
+| D1 | accel_smart.bpf.c (struct_ops, 92B priv, 5 callbacks, 4 maps) | `abdfc56` |
+| D2 | minimal load_smart() for verifier validation | `b32f763`(path A) |
+| D3 | accel_smart_dup.bpf.c (tc/egress duplicator) | `6906207` |
+| D4 | LoadedSmart full API + dup skel + reuse_fd + TcHook | `87f999c` |
+| D5 | cli/status/health wire-up + SmartSavedCfg | `74831d5` |
+| D6 | netns + veth + netem 集成测试 (PARTIAL: LOSSY 在 veth 测不出) | binaries `1fffd4d` |
+| LOSSY 升级 | reno → BDP+pacing(D6 暴露的问题) | `ed36e3e` |
+| D7 | preflight + acc.conf.example + 文档 + 部署脚本 | (本次 commit) |
+
+### 2.5 smart 算法核心思路
+
+3 状态自适应:
+- **GOOD**(干净链路): brutal 行为(rate × cwnd_gain × 80% ack-rate clamp)
+- **LOSSY**(噪音性丢包): BDP 估算 + 100% pacing + tc-bpf 多倍发包补偿
+- **CONGEST**(真拥塞): BDP 收敛(只降不升)+ 50% drain pacing → 90% cruise pacing
+
+分类信号:
+- `loss_ewma_bp`(EWMA α=1/8 over 5 秒窗口聚合 acked/losses)
+- `srtt/min_rtt` 比例(RTT 膨胀)
+- 200ms 最小驻留(滞后区防抖)
+- 双信号交叉:单个极强信号(loss ≥ 15% 或 RTT 膨胀 ≥ 50%)→ CONGEST
 
 ---
 
-## 8. 2.3 验收(7 场景,全 PASS)
+## 8. 验收脚本(binaries 分支)
 
-`verify-2.3.sh` 在 binaries 分支,7 场景:
+### 2.3 brutal 验收 — `verify-2.3.sh`(7 场景全 PASS)
 
 - A:brutal 加载 + Plan A pacing_status 验证
 - B:brutal_sockets 计数准确性
@@ -185,17 +262,29 @@ accel 收 SIGHUP 死掉(2.3 未处理 systemd 集成)。建议 `nohup ./accel &`
 - F:stop 时 sysctl 恢复
 - G:cubic 回归
 
+### 2.5 smart 验收 — 5 个递进脚本(D2 → D6 全 PASS)
+
+- `verify-smart-d2.sh`: 启动后 accel_smart 出现在 loaded 列表(verifier 接受)
+- `verify-smart-d4.sh`: smart_dup 程序进 kernel + smart_link_state map count=1(reuse_fd 生效)
+- `verify-smart-d5.sh`: 端到端接通 — 配置验证 + tc filter 真挂上 egress + status 输出
+- `verify-smart-d6.sh`: netns + veth + netem 三状态测试(LOSSY 在 veth 测不出,见 §5.11)
+- `d7-monitor.sh`: D7 部署 + 长跑监控(真业务流量,3 个时间点抓 status 快照)
+
 ---
 
 ## 9. 当前阻塞 / 下一步
 
-**无阻塞**。当前等用户实际使用反馈。
+**无阻塞**。当前(2.5-D7)等用户实际跨境业务流量反馈:
+- `./accel status` 中 smart state 分布是否合理(GOOD 主导,LOSSY 偶现,CONGEST 罕见)
+- `accel-incidents.log` 有无异常增长
+- 业务体感(SSH / haproxy / nginx / v2ray)是否比 brutal 更顺(尤其丢包高峰期)
+- `d7-monitor.sh` 跑 5 分钟 / 1 小时 / 24 小时三个快照
 
-可能的 2.4 方向(优先级待定):
-1. 真实性能验证(iperf3 + 跨境数据)
-2. AI 调节接口(brutal_rate_config 动态调节)
-3. 系统集成(systemd unit / 自动启动)
-4. 用户体验(status 输出 / config validation)
+可能的 2.6 方向(优先级待定):
+1. AI 调节接口(`smart_config_map` 已暴露给用户态,运行时可写)
+2. systemd unit / 自动启动
+3. status 输出补充(per-state cwnd / pacing 平均)
+4. 多接口 tc-bpf 支持(当前只支持单 interface)
 
 ---
 
