@@ -2,18 +2,23 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D2 (glibc 2.34 build)
+## 当前版本: 2.5-smart-D2 path A (glibc 2.34 build)
 
-- **2.5-D2 阶段**: accel_smart 算法的 BPF 程序进入仓库,用 bpftool 直接
-  跑 verifier 验收 (Rust 端集成在 D4 完成,所以这一步只测 kernel 是否
-  接受 BPF 程序)。
+- **2.5-D2 阶段**: accel_smart 算法的 BPF 程序进入仓库,通过 accel binary
+  自身的 libbpf-rs 加载器跑 kernel verifier 验收 (D4 集成的最小子集 —
+  只接 loader, 不接 cli/status/health/config)。
+- **D2 用 accel binary 而非 bpftool 的原因**: Debian 12 系统 bpftool 是
+  v7.1 / libbpf 1.1, **不认识** `.struct_ops.link` ELF section
+  (libbpf 1.2+ 才支持), 直接 skip 后报 -ENOTSUPP, verifier 一条指令
+  都没跑。accel binary 内嵌 libbpf-rs 0.26.2 (libbpf 1.4+) 能正确解析,
+  走的就是 D4 生产路径。
 - **新增文件**:
-  * `accel_smart.bpf.o` — 独立编译的 accel_smart struct_ops 对象 (clang
-    编, glibc 无关), 用 `bpftool struct_ops register` 加载。
-  * `verify-smart-d2.sh` — D2 验收脚本: md5 校验 → bpftool 注册 → 出错
-    抓 dmesg → 通过则确认 sysctl 可见。
-- **accel binary 也更新**: 内嵌 accel_smart skeleton (D4 才用), 当前
-  启动行为和 2.3 相同 (只加载 accel_cubic + accel_brutal)。
+  * `verify-smart-d2.sh` — D2 验收脚本: md5 校验 → 写 acc.conf → 后台
+    启动 accel → 看 "loaded:" 行包不包含 accel_smart → 失败抓
+    accel stdout + dmesg → 自动 stop。
+- **accel binary 更新**: 启动时 `all_loaders()` 多了 accel_smart 这条,
+  现在启动日志 "loaded:" 行包含三个算法。target sysctl 指向哪个不变 —
+  默认仍是 acc.conf 里 `algorithm = "accel_xxx"` 的那个。
 - **未变**: 2.3 的 cubic / brutal 行为完全不动。
 
 ## 历史版本: 2.3-D4 (glibc 2.34 build)
@@ -69,10 +74,10 @@ mv acc.conf.example acc.conf
 vim acc.conf      # 选 algorithm + 设 brutal rate_mbps (如选 brutal)
 ```
 
-### 2.5-D2 额外下载 (verifier 验收)
+### 2.5-D2 验收 (path A — 通过 accel binary 测 verifier)
 
 ```bash
-curl -LO https://github.com/123hehehe321/accel/raw/binaries/accel_smart.bpf.o
+# accel binary 已升级,无需额外文件,只多下一个脚本:
 curl -LO https://github.com/123hehehe321/accel/raw/binaries/verify-smart-d2.sh
 chmod +x verify-smart-d2.sh
 
@@ -80,8 +85,17 @@ chmod +x verify-smart-d2.sh
 sudo ./verify-smart-d2.sh
 ```
 
-期望全程 PASS。失败时脚本会自动打印 dmesg 切片 (verifier 日志), 把
-完整输出贴给架构师 — 不要本地改 BPF 代码 (PROJECT_CONTEXT §5.4)。
+脚本会:
+1. 校验 accel binary md5
+2. 临时写 `acc.conf` (target = accel_cubic — D2 不需要 [smart] 段, D4 才加)
+3. 后台启动 accel
+4. 看启动日志 `loaded:` 行包不包含 `accel_smart`
+   * 包含 → **D2 PASS**, kernel verifier 接受
+   * 不包含 → 抓 accel stdout 上的 `warning: accel_smart did not load: ...`
+     和 `dmesg` 切片 (verifier 错误在 dmesg 里)
+5. 自动 `./accel stop` 收尾
+
+失败时把完整输出贴给架构师 — 不要本地改 BPF 代码 (PROJECT_CONTEXT §5.4)。
 
 ## 启动 (cubic 默认)
 
@@ -165,9 +179,7 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `cf91f3d4ebe1fbb74da502ae45baf1b3`
-- **accel 大小**: 1,194,616 字节
-- **accel_smart.bpf.o MD5**: `b53402bd9e08d16b19265f4b5a81cd63`
-- **accel_smart.bpf.o 大小**: 505,976 字节
+- **accel MD5**: `f374a1cb6a3d576feb8092261a9fc678`
+- **accel 大小**: 1,239,608 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
