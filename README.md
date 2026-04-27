@@ -2,8 +2,15 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix3)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix3a)
 
+- **2.5-D7 fix3a (隐蔽 bug 修复)**: 修复 health.rs 在算法被外部 unregister
+  自愈 reload 时,**没重写 accel_skip_config map** 的隐蔽 bug。
+  外部 `bpftool struct_ops unregister` → health 30s 检测到 → 重新 load
+  → BPF map 默认全零 → 所有 LAN/loopback 连接被 brutal/smart 错误限速,
+  本机服务变慢(用户感知不到)。
+  fix:State 加 `skip_rules: Vec<SkipRule>` 字段,health.rs reload_one
+  exhaustively match 调每个变体的 set_skip。
 - **2.5-D7 fix3**: 把固定 `skip_local = true/false` 改成用户自定义 CIDR
   列表 `skip_subnet`,生产可控。
   - **必填字段**:`skip_subnet = "127.0.0.0/8,10.0.0.0/8,..."`(默认含
@@ -362,8 +369,8 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `1e6aa86695503013c04f11ebaf84b1f3`
-- **accel 大小**: 1,316,128 字节
+- **accel MD5**: `c7b4b1647b06e630e178cdeb51f03e43`
+- **accel 大小**: 1,316,992 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
 - **新增**: preflight 启动检查 + LOSSY BDP+pacing 升级 + 客户端 socket 自动探测 + 用户定义 CIDR 跳过 (skip_subnet,严格校验)
