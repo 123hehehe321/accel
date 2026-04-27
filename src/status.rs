@@ -204,7 +204,7 @@ fn render_connections(state: &State, s: &mut String) {
         })
     });
     if let Some(n) = brutal_count {
-        let _ = writeln!(s, "  brutal sockets:    {}", display_count(n));
+        let _ = writeln!(s, "  brutal sockets:    {n}");
     }
 
     // smart_sockets + state distribution only when smart is currently loaded.
@@ -219,51 +219,25 @@ fn render_connections(state: &State, s: &mut String) {
         })
     });
     if let Some((count, [good, lossy, congest])) = smart_info {
-        let _ = writeln!(s, "  smart sockets:     {}", display_count(count));
-        let g = sane_count(good);
-        let l = sane_count(lossy);
-        let c = sane_count(congest);
-        let total = g + l + c;
+        let _ = writeln!(s, "  smart sockets:     {count}");
+        let total = good + lossy + congest;
         if total > 0 {
             let _ = writeln!(
                 s,
                 "  smart state:       GOOD {} ({}%) | LOSSY {} ({}%) | CONGEST {} ({}%)",
-                g,
-                g * 100 / total,
-                l,
-                l * 100 / total,
-                c,
-                c * 100 / total
+                good,
+                good * 100 / total,
+                lossy,
+                lossy * 100 / total,
+                congest,
+                congest * 100 / total
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "  smart state:       (no active accelerated sockets)"
             );
         }
-    }
-}
-
-/// Threshold above which a per-CPU-summed counter is "obviously the
-/// result of cross-CPU underflow drift": values that high are bigger
-/// than any plausible socket count. We pick u64::MAX / 2 — the very
-/// top half of u64 space, where wrapped negative values land. Below
-/// this, accept the count at face value.
-const COUNTER_SANE_MAX: u64 = u64::MAX / 2;
-
-/// Map a possibly-wrapped per-CPU sum to the value we display in the
-/// `connections:` block. Wrapped values render as 0 instead of an
-/// 18-digit number that would just confuse the operator.
-fn display_count(n: u64) -> String {
-    if n > COUNTER_SANE_MAX {
-        format!("0 (likely cross-CPU drift; raw sum=0x{n:016x})")
-    } else {
-        n.to_string()
-    }
-}
-
-/// Same threshold, but returns 0 for wrapped values (used in arithmetic
-/// where displaying a number is not the goal).
-fn sane_count(n: u64) -> u64 {
-    if n > COUNTER_SANE_MAX {
-        0
-    } else {
-        n
     }
 }
 

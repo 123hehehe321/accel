@@ -2,7 +2,7 @@
 
 > **一句话介绍**：装在 Linux 服务器上的 TCP 加速器,使用 eBPF struct_ops 自定义 TCP 拥塞控制算法,和锐速同层级但架构更灵活。所有 TCP 服务零改动、真实客户端 IP 保留、与任何其他服务零冲突。
 
-**当前版本**: v0.2,**2.5 D1-D7 + fix1-fix6 完成** (2026-04-27),等 fix6 binary 真业务流量复测
+**当前版本**: v0.2,**2.5 D1-D7 + fix1-fix7 完成** (2026-04-27),等 fix7 binary 真业务流量复测
 
 **支持算法**:
 - `accel_cubic` — 2.1 基线,等效内核 CUBIC,稳定路径
@@ -14,7 +14,7 @@
 **验收**:
 - 2.3: 7 场景全 PASS (verify-2.3.sh A/B/C/D/E/F/G)
 - 2.5 D1-D6: verifier + reuse_fd + tc attach + status + 集成测试全 PASS
-- 2.5 D7 + fix1-fix6: VPS 真流量驱动迭代,binaries `5790594` / accel md5 `09f9d7cdac0428492279359b47d6a9a5`
+- 2.5 D7 + fix1-fix7: VPS 真流量驱动迭代,fix7 binary md5 `525350236166e0caac2cff43562c4f3e`
 
 > 📖 **新会话开始前请先读** [PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md)
 > 包含核心原则、工作模式、工程教训、已知特征等关键上下文。
@@ -337,11 +337,11 @@ sudo ./accel
 | **2.1** | 库迁移(aya→libbpf-rs)+ 首个 struct_ops 算法 | 累计 ~1350 | ✅ 完成 | 算法链路通畅,等效 CUBIC |
 | **2.2** | accel_bbr(基于 Linux tcp_bbr.c 移植)| — | ❌ 放弃 | 用户洞察:用户可直接 sysctl bbr,不值得做 |
 | **2.3** | accel_brutal(自写 BPF struct_ops,融合 tcp-brutal 思想)| 累计 ~2450 | ✅ 完成 | 高丢包吞吐显著提升 |
-| **2.5** | accel_smart(自适应 + tc-bpf 多倍发包)| 累计 ~3850 | ✅ D1-D7 + fix1-fix6 完成 | fix6 binary 真业务流量复测 |
+| **2.5** | accel_smart(自适应 + tc-bpf 多倍发包)| 累计 ~3800 | ✅ D1-D7 + fix1-fix7 完成 | fix7 binary 真业务流量复测 |
 
 ### 6.2 当前阶段
 
-**当前**:2.5-D7 fix6 收官,等用户在 fix6 binary 上跑真业务复测。`./accel status` 看 smart state 分布合理性(GOOD 主导,LOSSY 偶现,CONGEST 罕见)。
+**当前**:2.5-D7 fix7 收官,等用户在 fix7 binary 上跑真业务复测。`./accel status` 看 smart state 分布合理性(GOOD 主导,LOSSY 偶现,CONGEST 罕见),`smart sockets:` 应稳定为非负小整数。
 
 **本文档覆盖**:第一步 → 2.1 → 2.3 → 2.5 全周期。
 
@@ -647,11 +647,15 @@ connections:
   smart state:       GOOD 40 (88%) | LOSSY 4 (8%) | CONGEST 1 (2%)
 ```
 
-**counter 兜底显示**(fix5):BPF map 用 `BPF_MAP_TYPE_PERCPU_ARRAY`,
-用户态 `wrapping_add` 累加,数学上正确。**但生产偶发跨 CPU 不平衡**
-(疑似 kernel struct_ops 边界 callback 不严格对称)。`status.rs::display_count`
-在 `n > u64::MAX/2` 时显示为 `0 (likely cross-CPU drift; raw sum=0xXXXX)`,
-保证用户看不到 18 位天文数字。这是 UX 兜底,不解决底层不对称。
+无活跃 sock 时(全 skip 或刚启动无流量),`smart state:` 行显示
+`(no active accelerated sockets)`,**不会整行消失**。
+
+**计数策略**(fix7 起):counter 不在 `init` 而在 **第一次 cong_main** 时
+bump,`smart_priv->counted` 标记位守卫 release 端的 -1。kernel TCP cong-control
+生命周期有十多种 init/release 路径不严格成对(TFO 回滚 / SYN cookie / setsockopt
+在 CLOSED 上换 CC / disconnect / mini-sock 等),但 cong_main 只在 sk 真处理
+ACK 时触发,所以"计数 = 真实在被算法干预的连接数",永远不会下溢出现负数大值。
+fix5 时期的 `display_count` 兜底已删,死代码不留。
 
 ### 9.5.6 不加速的网段(skip_subnet,2.5 后修,LPM_TRIE 实现)
 
@@ -713,7 +717,8 @@ skip_subnet = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/1
 - [x] fix4: PERCPU counter 解决 ARRAY race + LPM_TRIE 解决 verifier 路径爆炸
 - [x] fix5: 删除 `rtt_congest_pct`(VPN/跨境 RTT 不可靠)+ `duplicate_factor` 配置 + display_count UX 兜底
 - [x] fix6: dup_factor 上限 100 + 全代码审计(死宏 / 冗余 clone / unwrap → if let)
-- [ ] fix6 binary 真业务流量再复测(当前等用户反馈)
+- [x] fix7: smart/brutal counter 改 first-ACK gate(`priv->counted` 标记)+ `smart state:` 行无条件显示 + 删除 `display_count`/`sane_count`/`COUNTER_SANE_MAX` 死代码
+- [ ] fix7 binary 真业务流量再复测(当前等用户反馈)
 
 ---
 

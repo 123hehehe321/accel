@@ -6,11 +6,11 @@
 
 ## 1. 项目当前状态(2026-04-27)
 
-- **版本**:v0.2 / **2.5-D7 fix6 完成,生产部署 + 长跑观察阶段**
+- **版本**:v0.2 / **2.5-D7 fix7 完成,生产部署 + 长跑观察阶段**
 - **支持算法**:`accel_cubic`(基线) + `accel_brutal`(激进) + **`accel_smart`(2.5 新增,纯丢包自适应)**
-- **代码量**:~3850 行 / 3000 预算(用户拍板放宽,2.6+ 严控)
-- **当前源分支 tip**:`claude/accel-smart` `f331264` (fix6)
-- **当前 binaries tip**:`5790594` (fix6) / accel md5 `09f9d7cdac0428492279359b47d6a9a5`
+- **代码量**:~3800 行 / 3000 预算(用户拍板放宽,2.6+ 严控)
+- **当前源分支 tip**:`claude/accel-smart` (fix7,本次提交)
+- **当前 binaries tip**:fix7 / accel md5 `525350236166e0caac2cff43562c4f3e`
 
 历史里程碑:
 - 2.3 收官:main `78b7680` / binaries `7617cf8` / binary md5 `f14594ac59d737df516a0dd32dacf8b3`
@@ -31,6 +31,7 @@
 | fix5 | smart sockets 显示天文数字(跨 CPU drift) | `display_count` 用户态兜底显示 0 |
 | fix6 | dup_factor 8 上限不够极端环境 | 上限 8 → 100 |
 | fix6 | 全代码审计 | 删 `accel_brutal::max_t` 死宏 + cli redundant clone + unwrap → if let |
+| fix7 | smart sockets 偶现负数大值 + smart state 行偶尔不显示 | 计数从 init 移到第一次 ACK(`priv->counted` 标记),release 同标记守卫 → init/release 路径不平衡天然消失;删除 `display_count`/`sane_count` 兜底死代码 |
 
 ---
 
@@ -200,38 +201,48 @@ cwnd 从初始低位爬升需要几分钟。期间吞吐暴跌(8 Gbps → 49 Mbp
 - LOSSY:`cwnd = BDP`(可升可降,跟随带宽);pacing = 100% bw
 - CONGEST:`cwnd = min(cwnd, BDP)`(只降不升,主动让路);pacing = 50% drain → 90% cruise
 
-### 5.13c BPF counter race → percpu map (fix4)
+### 5.13c BPF counter race → percpu map (fix4) → first-ACK gate (fix7)
 
 D7 真业务流量下发现 `smart sockets: 18446744073709549559`(约 `u64::MAX - 2057`)
-——典型的整数下溢。原因是 ARRAY map 加 `if (*cnt > 0) __sync_fetch_and_sub` 这种
-"check-then-decrement"非原子,多核并发 release 时会双减:
+——整数下溢。原因是 ARRAY map 的 `if (*cnt > 0) __sync_fetch_and_sub` 这种
+"check-then-decrement" 非原子,多核并发 release 时会双减(CPU A/B 同时看到 cnt=1
+都通过检查,各自减 1,第二次减 wrap 到 2^64-1)。
 
-  CPU A 看到 cnt=1,通过 `> 0` 检查
-  CPU B 看到 cnt=1,通过 `> 0` 检查
-  CPU A 减 1 → 0
-  CPU B 减 1 → wrap to 2^64-1
+**fix4: `BPF_MAP_TYPE_PERCPU_ARRAY`**:每 CPU 一份 slot,内核在 BPF prog 执行期
+disable 抢占,单 CPU 内串行化,无需原子前缀。用户态 `wrapping_add` 累加,跨 CPU
+init/release 不平衡时 u64 模运算还原正确总和。
 
-累计触发 2057 次后看到这个数。**不是 transient off-by-one**(原来 brutal 注释这么
-说的太乐观了),是真实的累积下溢。
+**fix5 观察**:percpu 解决了数据竞争,但 fix5 真业务流量下还是偶发负数(`u64::MAX
+- N` 显示成天文数字)。当时怀疑跨 CPU 不平衡是 kernel struct_ops 边界 callback
+不严格对称,加了 `display_count` 兜底(>u64::MAX/2 显示 0)。**这是症状治疗不是
+病因治疗**。
 
-**修复:用 `BPF_MAP_TYPE_PERCPU_ARRAY`**:每个 CPU 一份独立 slot,内核在 BPF prog
-执行期间 disable 抢占,单 CPU 内访问串行化,**不需要任何原子前缀**。BPF 端代码
-变成 `(*cnt)++` / `(*cnt)--`,简洁 + 无 race。
+**fix7 真正的根治**:把 counter 操作从 `init`/`release` 移到 **第一次 cong_main
+触发时**。`smart_priv` / `brutal_priv` 加 `__u8 counted` 标记位:
 
-用户态读取:`map.lookup_percpu(key, ...)` 返回 `Vec<Vec<u8>>`,遍历用
-`wrapping_add` 累加。即使某个 CPU 的 slot 单独看下溢了(socket A init 在 CPU 0,
-release 在 CPU 5,CPU 0 +1、CPU 5 -1 → CPU 5 = u64::MAX),u64 模 2^64 加法保证
-sum 还原正确值。
+- `smart_init`:只设 priv 初值,**不动 counter**
+- `smart_main` 第一次跑:`if (!p->counted) { ++cnt; ++state[GOOD]; p->counted = 1; }`
+- `smart_release`:`if (p->skip || !p->counted) return;` 然后才减
 
-**fix5 后续观察**:即使切到 percpu,生产环境仍偶发跨 CPU 不平衡(疑似 kernel
-struct_ops 边界 callback 不严格对称,如 LISTEN socket / SYN cookie 路径)。
-**status.rs 加 `display_count` 兜底**:`> u64::MAX/2` 显示为 `0 (likely
-cross-CPU drift; raw sum=0xXXXX)`。这是 UX 修复,不解决底层不对称,但生产看
-数字不会被 18 位天文数字误导。
+为什么彻底:kernel TCP cong control 生命周期有十多种入口/出口(TFO 回滚、SYN
+cookie 提升、setsockopt 在 CLOSED 上换 CC、disconnect、各种 mini-sock 路径),
+init/release 不严格 1:1。但 **cong_main 只在 sk 真的处理 ACK 时才触发**——
+ESTABLISHED 状态下的真实数据连接。任何"幽灵 init+release 对"都没机会跑到 main,
+counter 不会被乱动。
 
-**通用教训**:BPF 内任何 "check 然后 mutate" 的两步操作都有竞态。要么用 atomic
-CAS 循环(verifier 难过),要么用 percpu map(简单且 verifier 友好)。计数器场景
-默认选 percpu。再加用户态 saturating display 兜底,生产显示永远不出离谱数字。
+副作用:`status.rs::display_count` / `sane_count` / `COUNTER_SANE_MAX` **全部
+删除**(死代码),`smart sockets:` 的兜底分支再也不可能触发。同时 `smart state:`
+那行原来是 `if total > 0` 才显示,fix7 改成 smart 加载就总显示一行(总和为 0 时
+显示 `(no active accelerated sockets)`)。
+
+**通用教训**:
+1. BPF struct_ops 的 init/release **不要假设严格成对**。kernel 内部生命周期路径
+   太多,任何依赖"init 调几次 release 调几次"的状态都会漂。
+2. 计数器要挂在"真实有意义的事件"上,不挂"建立/销毁"。对 cong control 来说,
+   "处理过 ACK" 比 "init 跑了" 更接近用户想知道的"这 sk 现在被算法在干预吗"。
+3. 永远警惕**"加兜底显示" vs "改根因"** 的分界。fix5 加 display_count 是对的
+   (当时根因没找到,先别给用户看 18 位数字),fix7 找到根因后兜底就要删 ——
+   留着是 dead code,而且是会让人误以为根因还在的 dead code。
 
 ### 5.13d 算法分类信号选择 = 看场景,不要复杂(fix5)
 
@@ -405,20 +416,19 @@ skip 机制(fix3+fix4):
 
 ## 9. 当前阻塞 / 下一步
 
-**无阻塞**。当前(2.5-D7 fix6)等用户在 fix6 binary 上跑真业务流量复测:
+**无阻塞**。当前(2.5-D7 fix7)等用户在 fix7 binary 上跑真业务流量复测:
 - `./accel status` 中 smart state 分布是否合理
   - 期望(纯丢包判定后):GOOD 占 80%+,LOSSY 在隧道/跨境出现,CONGEST 仅在真排队拥塞时
   - 不期望:CONGEST 长期占比 > 50%(fix5 前的 83% 已通过删 RTT 信号修掉)
-- `smart sockets:` 数字应是合理值(fix5 的 display_count 兜底:跨 CPU drift 时显示 `0 (likely cross-CPU drift; raw sum=0xXXXX)`)
+- `smart sockets:` 数字应稳定为非负小整数(fix7 的 first-ACK gate 让 init/release 不平衡天然不出现)
+- `smart state:` 行**永远显示**(总和 0 时显示 `(no active accelerated sockets)`)
 - `smart dup factor:` 行展示当前倍数 + LOSSY 解释
 - `accel-incidents.log` 有无异常增长
 - 业务体感(SSH / haproxy / nginx / v2ray)是否比 brutal 更顺(尤其丢包高峰期)
 - `d7-monitor.sh` 跑 5 分钟 / 1 小时 / 24 小时三个快照
 
-跨 CPU drift 后续(fix5 已加显示兜底,但根因未查清):
-- 怀疑 kernel struct_ops 边界 callback 不严格对称(LISTEN socket / SYN cookie 路径)
-- 当前不影响生产(percpu wrap 数学正确 + UX 兜底),只是有少量 raw_sum 大数
-- 真要根治需要内核侧调研,2.6+ 视情况
+fix7 后已不存在跨 CPU drift 兜底显示 —— 如果出现负数大值,那就是 fix7 也没盖住
+的真 bug,请抓 status 输出 + dmesg 反馈。
 
 可能的 2.6 方向(优先级待定):
 1. AI 调节接口(`smart_config_map` 已暴露给用户态,运行时可写)

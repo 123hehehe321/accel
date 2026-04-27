@@ -615,13 +615,12 @@ fn write_skip_config(
 
 /// Sum a per-CPU u64 counter map's values across all online CPUs.
 ///
-/// Modular-arithmetic note: a socket may be init'd on one CPU and
-/// released on another, so any individual CPU's slot can drift past
-/// u64::MAX (i.e. wrap around). The wrapping_add chain still recovers
-/// the correct global count because (a + b) mod 2^64 across all
-/// per-CPU contributions equals the true count whenever init/release
-/// balance globally — which they do by construction (`if (b->skip)
-/// return;` symmetry).
+/// Counters are bumped at first ACK in cong_main and decremented in
+/// release iff the same priv->counted flag was set, so per-sk lifecycle
+/// pairs balance exactly. A sk may be init'd on one CPU and released on
+/// another, so any individual CPU's slot can briefly go negative; the
+/// wrapping_add chain recovers the correct sum because u64 addition is
+/// associative modulo 2^64.
 fn sum_percpu_u64(percpu: &[Vec<u8>], context_name: &str) -> Result<u64> {
     let mut total: u64 = 0;
     for (cpu, bytes) in percpu.iter().enumerate() {

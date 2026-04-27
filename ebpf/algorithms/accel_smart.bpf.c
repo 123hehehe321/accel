@@ -76,8 +76,9 @@ struct smart_priv {
 	__u32 state;          /* LINK_GOOD / LINK_LOSSY / LINK_CONGEST */
 	__u32 last_change;    /* tcp_jiffies32 of last state transition */
 	__u8  skip;           /* 1 if this socket is local/intranet */
+	__u8  counted;        /* 1 once smart_main bumped the per-sk counters */
 };
-/* 80 + 4 + 4 + 4 + 1 → padded to 96 bytes ≤ 104 (ICSK_CA_PRIV_SIZE). */
+/* 80 + 4 + 4 + 4 + 1 + 1 → padded to 96 bytes ≤ 104 (ICSK_CA_PRIV_SIZE). */
 _Static_assert(sizeof(struct smart_priv) <= ICSK_CA_PRIV_SIZE,
 	       "smart_priv too large for icsk_ca_priv");
 
@@ -115,12 +116,14 @@ struct {
 	__type(value, struct smart_config);
 } smart_config_map SEC(".maps");
 
-/* +1 in init, -1 in release. status reads. */
-/* PERCPU_ARRAY rationale: see brutal's same comment. Per-CPU slots are
- * single-threaded inside BPF (preemption disabled), so init / release /
- * state-transition increments and decrements need no atomic prefix.
- * Per-CPU drift is fine because userspace sums across CPUs and the
- * sum recovers the correct global count via u64 modular arithmetic. */
+/* Number of sockets currently being shaped by accel_smart. Bumped on the
+ * first cong_control call (see brutal_socket_count for full rationale of
+ * "first ACK" instead of "init" — same problem, same solution). The
+ * paired decrement in smart_release is gated on priv->counted, so any
+ * sk that never reached smart_main contributes zero net.
+ *
+ * PERCPU_ARRAY: per-CPU slots, preempt-disabled, no atomic prefix
+ * needed. Userspace sums across CPUs. */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
@@ -128,7 +131,10 @@ struct {
 	__type(value, __u64);
 } smart_socket_count SEC(".maps");
 
-/* Per-state population. keys 0/1/2 = GOOD/LOSSY/CONGEST. status reads. */
+/* Per-state population. keys 0/1/2 = GOOD/LOSSY/CONGEST. The same
+ * priv->counted flag gates the +1 in smart_main and the -1 in
+ * smart_release; state transitions inside smart_main move counts
+ * between slots without touching the total. */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 3);
@@ -421,13 +427,8 @@ void BPF_PROG(smart_init, struct sock *sk)
 	p->state = LINK_GOOD;
 	p->last_change = tcp_jiffies32;
 
-	/* Local/intranet bypass. Smart's classifier additionally misreads
-	 * near-zero min_rtt as CONGEST (RTO triggers srtt spike, ratio
-	 * blows up — see PROJECT_CONTEXT §5.11), so skipping is the right
-	 * thing to do regardless of whether you also want rate-limit-skip.
-	 * Don't bump socket_count or state_count — the status counters
-	 * should reflect only WAN sockets that the algorithm is actually
-	 * shaping. _main and _release both check p->skip and short-circuit. */
+	/* Local/intranet bypass. _main and _release both honour p->skip
+	 * and short-circuit with zero net counter movement. */
 	if (should_skip(sk)) {
 		p->skip = 1;
 		return;
@@ -435,30 +436,24 @@ void BPF_PROG(smart_init, struct sock *sk)
 
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
-	/* Pacing: as in accel_brutal Plan B — do NOT write sk_pacing_status
-	 * directly. The kernel auto-promotes to SK_PACING_NEEDED the first
-	 * time cong_control sets sk_pacing_rate (which smart does in
-	 * GOOD/CONGEST paths). LOSSY leaves pacing to the kernel default. */
+	/* Pacing: Plan B — kernel auto-promotes SK_PACING_NEEDED on the
+	 * first sk_pacing_rate write from smart_apply_good/_congest. LOSSY
+	 * leaves pacing to the kernel default. */
 
-	/* PERCPU_ARRAY: this CPU's slots are mutated single-threadedly. No
-	 * atomic prefix needed; userspace sums across CPUs. See map decl
-	 * comment for the underflow-via-modular-arithmetic argument. */
-	__u32 zero = 0;
-	__u64 *cnt = bpf_map_lookup_elem(&smart_socket_count, &zero);
-	if (cnt)
-		(*cnt)++;
-
-	__u64 *good = bpf_map_lookup_elem(&smart_state_count, &zero);
-	if (good)
-		(*good)++;
+	/* No counter bump here. smart_main does it on the first ACK; that
+	 * filters out kernel lifecycle paths where init/release fire
+	 * without the sk ever entering productive data exchange. */
 }
 
 SEC("struct_ops")
 void BPF_PROG(smart_release, struct sock *sk)
 {
 	struct smart_priv *p = inet_csk_ca(sk);
-	/* Skipped sockets never bumped any counter — symmetric no-op here. */
-	if (p->skip)
+
+	/* Two early-out cases, both produce zero net counter movement:
+	 *   skip == 1     — local/intranet sk, _main was a no-op too.
+	 *   counted == 0  — _main never ran, no counters to undo. */
+	if (p->skip || !p->counted)
 		return;
 
 	__u32 zero = 0;
@@ -485,10 +480,24 @@ __u32 BPF_PROG(smart_main, struct sock *sk, __u32 ack, int flag,
 	if (p->skip)
 		return 0;
 
+	__u32 zero = 0;
+
+	/* First-ACK gate: this sk is now actually being shaped by smart, so
+	 * bump socket_count (1 slot) + state_count[GOOD] (initial state).
+	 * smart_release pairs the decrement on the same `counted` flag. */
+	if (!p->counted) {
+		__u64 *cnt = bpf_map_lookup_elem(&smart_socket_count, &zero);
+		if (cnt)
+			(*cnt)++;
+		__u64 *good = bpf_map_lookup_elem(&smart_state_count, &zero);
+		if (good)
+			(*good)++;
+		p->counted = 1;
+	}
+
 	if (rs->delivered < 0 || rs->interval_us <= 0)
 		return 0;
 
-	__u32 zero = 0;
 	struct smart_config *cfg =
 		bpf_map_lookup_elem(&smart_config_map, &zero);
 	if (!cfg)

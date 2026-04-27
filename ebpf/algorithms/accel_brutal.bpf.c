@@ -67,11 +67,12 @@ struct brutal_pkt_info {
 
 struct brutal_priv {
 	struct brutal_pkt_info slots[PKT_INFO_SLOTS];
-	__u8 skip;   /* 1 if this socket is local/intranet (skip rate limiting) */
+	__u8 skip;     /* 1 if this socket is local/intranet (skip rate limiting) */
+	__u8 counted;  /* 1 once we've bumped brutal_socket_count for this sk */
 };
 
 /* Compile-time guard against future kernel shrinking icsk_ca_priv or our
- * struct growing. 80 + 1 padded to 88 bytes; 104 available. */
+ * struct growing. 80 + 1 + 1 padded to 88 bytes; 104 available. */
 _Static_assert(sizeof(struct brutal_priv) <= ICSK_CA_PRIV_SIZE,
 	       "brutal_priv too large for icsk_ca_priv");
 
@@ -87,28 +88,23 @@ struct {
 	__type(value, __u64);
 } brutal_rate_config SEC(".maps");
 
-/* Number of sockets currently using accel_brutal. Bumped in init,
- * decremented in release. Status command reads it.
+/* Number of sockets currently being shaped by accel_brutal. Bumped on
+ * the first cong_control call (which the kernel only invokes for sockets
+ * actually processing ACKs in ESTABLISHED-like states), decremented in
+ * release iff we bumped. Status command reads it.
  *
- * PERCPU_ARRAY: each CPU writes only its own slot, so init/release
- * never race against each other. The previous BPF_MAP_TYPE_ARRAY +
- * `if (*cnt > 0) __sync_fetch_and_sub` pattern looked safe but had a
- * real race window:
+ * Why "first ACK" rather than init: kernel TCP has many lifecycle paths
+ * that call init/release without the socket ever entering productive
+ * data exchange (TFO rollback, SYN-cookie promotion, setsockopt CC swap
+ * on a CLOSED sk, etc.). Counting at first ACK is the cleanest gate that
+ * "this sock is really being shaped right now" — and brutal_release
+ * checks the same `counted` flag, so any sk that never reached cong_main
+ * decrements nothing. Result: counter stays exactly equal to the live
+ * shaped-socket count, no underflow ever.
  *
- *     CPU A: read cnt=1, pass `> 0` check
- *     CPU B: read cnt=1, pass `> 0` check
- *     CPU A: cnt -= 1 → 0
- *     CPU B: cnt -= 1 → underflow → 2^64-1
- *
- * On a busy VPS this accumulated thousands of underflow events,
- * producing the 18446744073709549559 figure observed in production.
- *
- * With PERCPU_ARRAY the kernel disables preemption while the BPF
- * program runs, so a single CPU's slot is never concurrently mutated
- * — `*cnt += 1` and `*cnt -= 1` need no atomic prefix. Userspace
- * reads via `lookup_percpu()` and sums across CPUs; transient
- * per-CPU underflows wrap modulo 2^64 and the sum still recovers the
- * correct global count. */
+ * PERCPU_ARRAY: each CPU mutates only its own slot under preempt-disable,
+ * so the increment/decrement need no atomic prefix. Userspace sums
+ * across CPUs. */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
@@ -210,74 +206,44 @@ void BPF_PROG(brutal_init, struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct brutal_priv *b = inet_csk_ca(sk);
 
-	/* (1) Zero the per-socket window. Always succeeds; do it first so
-	 * release's symmetric counter decrement is justified even if a
-	 * later step in init noops. */
+	/* Zero the per-socket window. b->skip and b->counted both start 0. */
 	__builtin_memset(b, 0, sizeof(*b));
 
-	/* (1.5) Local/intranet bypass. If skip_local is on in acc.conf and
-	 * either endpoint is loopback / RFC1918 / IPv6 ULA, set the priv
-	 * skip flag and return early. _main and _release both check the
-	 * flag and short-circuit. Critically we also skip the
-	 * brutal_socket_count bump, so the status counter only reflects
-	 * sockets that are actually being rate-limited. */
+	/* Local/intranet bypass. If either endpoint matches accel_skip_v4 /
+	 * accel_skip_v6 (acc.conf skip_subnet), set skip and bail. _main
+	 * and _release both honour this flag. */
 	if (should_skip(sk)) {
 		b->skip = 1;
 		return;
 	}
 
-	/* (2) No slow-start: brutal trusts the configured rate. */
+	/* No slow-start: brutal trusts the configured rate. */
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
-	/* (3) Pacing enable — Plan B: removed direct write of
-	 * SK_PACING_NEEDED here.
-	 *
-	 * Original tcp-brutal uses cmpxchg here for thread safety:
-	 *   cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
-	 *
-	 * Plan A (direct write `sk->sk_pacing_status = SK_PACING_NEEDED;`)
-	 * passed the verifier on v6.12, but runtime diagnostics on user VPS
-	 * showed init was being silently truncated past this write —
-	 * brutal_init run_cnt=24 yet brutal_socket_count stayed at 0 across
-	 * 3 active accel_brutal connections. Hypothesis: v6.12 struct_ops
-	 * runtime aborts the remainder of init when the direct sk_pacing_status
-	 * write hits a kernel-side safety check that verifier static
-	 * analysis didn't catch.
-	 *
-	 * Plan B: omit the write entirely. The kernel auto-promotes
-	 * pacing_status to SK_PACING_NEEDED the first time a cong_control
-	 * algorithm sets sk_pacing_rate — which brutal_update_rate does
-	 * on every ACK (see line setting sk->sk_pacing_rate below). So
-	 * functional pacing is unaffected.
-	 *
-	 * If user VPS testing shows pacing not actually engaged after this
-	 * change, escalate to Plan C (bpf_setsockopt with TCP_PACING_RATE
-	 * or equivalent).
-	 */
+	/* Pacing — Plan B: do NOT write sk_pacing_status here. The kernel
+	 * auto-promotes to SK_PACING_NEEDED on the first cong_control set
+	 * of sk_pacing_rate (which brutal_update_rate does each ACK).
+	 * Direct write hit silent v6.12 init truncation in earlier testing. */
 
-	/* (4) Bump the per-CPU brutal-socket counter. PERCPU_ARRAY: kernel
-	 * disables preemption around the BPF prog, so this CPU's slot is
-	 * mutated single-threadedly — no atomic prefix needed. */
-	__u32 zero = 0;
-	__u64 *cnt = bpf_map_lookup_elem(&brutal_socket_count, &zero);
-	if (cnt)
-		(*cnt)++;
+	/* No counter bump here. brutal_main does it on the first ACK so
+	 * that "phantom" init/release pairs (kernel paths where the sk
+	 * never actually flows data) don't drift the counter. */
 }
 
 SEC("struct_ops")
 void BPF_PROG(brutal_release, struct sock *sk)
 {
 	struct brutal_priv *b = inet_csk_ca(sk);
-	/* Skipped sockets never bumped the counter — symmetric no-op here. */
-	if (b->skip)
+
+	/* Two early-out cases, both produce zero net counter movement:
+	 *   skip == 1     — local/intranet sk, _main was a no-op too.
+	 *   counted == 0  — _main never ran (no ACK ever processed for
+	 *                   this sk), so we never bumped. */
+	if (b->skip || !b->counted)
 		return;
 
 	__u32 zero = 0;
 	__u64 *cnt = bpf_map_lookup_elem(&brutal_socket_count, &zero);
-	/* PERCPU_ARRAY: this CPU's slot is mutated single-threadedly. A
-	 * socket may be init'd on CPU A and released on CPU B, so any one
-	 * CPU's slot can drift negative — but userspace sums across CPUs
-	 * and modular arithmetic recovers the correct global count. */
 	if (cnt)
 		(*cnt)--;
 }
@@ -296,6 +262,17 @@ __u32 BPF_PROG(brutal_main, struct sock *sk, __u32 ack, int flag,
 	 * (whatever the previous CC produced) handles it. */
 	if (b->skip)
 		return 0;
+
+	/* First-ACK gate: this is the moment we declare the sk "actually
+	 * being shaped by brutal" and bump the counter. brutal_release pairs
+	 * the decrement on the same flag. See brutal_socket_count comment. */
+	if (!b->counted) {
+		__u32 zero = 0;
+		__u64 *cnt = bpf_map_lookup_elem(&brutal_socket_count, &zero);
+		if (cnt)
+			(*cnt)++;
+		b->counted = 1;
+	}
 
 	/* Drop invalid samples (warming up, retransmits without delivery). */
 	if (rs->delivered < 0 || rs->interval_us <= 0)
