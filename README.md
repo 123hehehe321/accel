@@ -2,8 +2,22 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix3a)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix4)
 
+- **2.5-D7 fix4 (生产关键 bug 修复 + LPM_TRIE 重构)**:
+  - **(A) BPF 计数器下溢竞态**: D7 真业务流量下出现
+    `smart sockets: 18446744073709549559` (≈ u64::MAX − 2057) — 不是
+    一次性偏差,是 ARRAY map "check-then-decrement" 多核竞态累积下溢。
+    **修**: `brutal_socket_count` / `smart_socket_count` /
+    `smart_state_count` 全部从 `BPF_MAP_TYPE_ARRAY` 改成
+    `BPF_MAP_TYPE_PERCPU_ARRAY`。每 CPU 一份 slot,无需原子前缀,
+    单 CPU 内串行化。用户态 `lookup_percpu` + wrapping_add 求和恢复
+    正确全局计数(u64 模 2^64 算术保证)。
+  - **(B) skip_subnet 改用 LPM_TRIE**: 原"32-array + #pragma unroll"
+    可能撞 BPF verifier path explosion(理论 64 路径组合)。
+    **改用 BPF 内核为 CIDR 匹配设计的 `BPF_MAP_TYPE_LPM_TRIE`**。
+    BPF 代码从 100 行减到 30 行 + verifier 风险结构性归零 +
+    容量从 32 提升到 IPv4 256 + IPv6 256 + 性能 O(n) → O(log n)。
 - **2.5-D7 fix3a (隐蔽 bug 修复)**: 修复 health.rs 在算法被外部 unregister
   自愈 reload 时,**没重写 accel_skip_config map** 的隐蔽 bug。
   外部 `bpftool struct_ops unregister` → health 30s 检测到 → 重新 load
@@ -369,8 +383,8 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `c7b4b1647b06e630e178cdeb51f03e43`
-- **accel 大小**: 1,316,992 字节
+- **accel MD5**: `4257b7fee88ba9d5718037c0d1e9675f`
+- **accel 大小**: 1,322,520 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
-- **新增**: preflight 启动检查 + LOSSY BDP+pacing 升级 + 客户端 socket 自动探测 + 用户定义 CIDR 跳过 (skip_subnet,严格校验)
+- **新增**: preflight 启动检查 + LOSSY BDP+pacing + 客户端 socket 自动探测 + skip_subnet 用 LPM_TRIE + 计数器 PERCPU_ARRAY 修下溢
