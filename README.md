@@ -2,7 +2,7 @@
 
 > **一句话介绍**：装在 Linux 服务器上的 TCP 加速器,使用 eBPF struct_ops 自定义 TCP 拥塞控制算法,和锐速同层级但架构更灵活。所有 TCP 服务零改动、真实客户端 IP 保留、与任何其他服务零冲突。
 
-**当前版本**: v0.2,**2.5 D1-D7 + fix1-fix7 完成** (2026-04-27),等 fix7 binary 真业务流量复测
+**当前版本**: v0.2,**2.5 D1-D7 + fix1-fix7-static 完成** (2026-04-27),全静态 binary,等真业务流量复测
 
 **支持算法**:
 - `accel_cubic` — 2.1 基线,等效内核 CUBIC,稳定路径
@@ -14,7 +14,7 @@
 **验收**:
 - 2.3: 7 场景全 PASS (verify-2.3.sh A/B/C/D/E/F/G)
 - 2.5 D1-D6: verifier + reuse_fd + tc attach + status + 集成测试全 PASS
-- 2.5 D7 + fix1-fix7: VPS 真流量驱动迭代,fix7 binary md5 `525350236166e0caac2cff43562c4f3e`
+- 2.5 D7 + fix1-fix7-static: VPS 真流量驱动迭代,**全静态** binary md5 `60637b4dacea4b98735733f97aaf10b0` (3037064 bytes,无 GLIBC 依赖)
 
 > 📖 **新会话开始前请先读** [PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md)
 > 包含核心原则、工作模式、工程教训、已知特征等关键上下文。
@@ -283,6 +283,36 @@ accel/
 | `src/incidents.rs` | 事件日志的读写(追加型文本文件)|
 | `src/benchmark.rs` | `./accel test` 和 `./accel benchmark` 的实现 |
 | `src/tcp_info.rs` | 调用 getsockopt(TCP_INFO) 或解析 ss 输出 |
+
+---
+
+## 4.5 编译(必读 — 任何 binary 都必须全静态)
+
+**铁律:不要 `cargo build --release` 直接发 binary 到 binaries 分支**。
+fix7 那次踩过坑:dev VM 是 Ubuntu 24.04 / glibc 2.39,出来的 binary 在
+Debian 12 / glibc 2.36 VPS 上 `version GLIBC_2.39 not found`,systemd
+restart-loop 100+ 次,完全跑不起来。详见 PROJECT_CONTEXT §5.15。
+
+**正确做法**:
+
+```bash
+# 一次性安装(host 已装可跳):
+apt install -y build-essential clang pkg-config \
+               libelf-dev zlib1g-dev libzstd-dev linux-libc-dev
+
+# 每次发 binary:
+./build-static.sh
+```
+
+脚本会自动:
+1. 跑 `cargo build --release`(用 `.cargo/config.toml` 锁死的全静态参数)
+2. 用 `file` / `ldd` / `objdump` 三重验证 binary 真静态、无 GLIBC_ 符号
+3. 输出 md5 + 准备好 binaries 分支发布命令
+
+`.cargo/config.toml` 里固化了:`+crt-static` + `-C link-arg=-static` +
+`-l:libelf.a -l:libz.a -l:libzstd.a`。glibc + libelf + libbpf + zlib +
+zstd 全嵌入 binary,生成的可执行约 3 MB,**任何 x86_64 Linux ≥ 6.4
+都能跑**,不挑发行版、不挑 glibc 版本。
 
 ---
 
@@ -737,7 +767,8 @@ skip_subnet = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/1
 - [x] fix5: 删除 `rtt_congest_pct`(VPN/跨境 RTT 不可靠)+ `duplicate_factor` 配置 + display_count UX 兜底
 - [x] fix6: dup_factor 上限 100 + 全代码审计(死宏 / 冗余 clone / unwrap → if let)
 - [x] fix7: smart/brutal counter 改 first-ACK gate(`priv->counted` 标记)+ `smart state:` 行无条件显示 + 删除 `display_count`/`sane_count`/`COUNTER_SANE_MAX` 死代码
-- [ ] fix7 binary 真业务流量再复测(当前等用户反馈)
+- [x] fix7-static: 全静态构建(`.cargo/config.toml` + `build-static.sh`),不再依赖目标系统 glibc 版本(详见 PROJECT_CONTEXT §5.15)
+- [ ] fix7-static binary 真业务流量再复测(当前等用户反馈)
 
 ---
 

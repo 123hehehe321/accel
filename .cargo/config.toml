@@ -1,0 +1,65 @@
+# MANDATORY: every accel binary is built fully statically.
+#
+# WHY: production binary is distributed via the `binaries` orphan branch
+# and dropped onto VPS hosts running Debian 12 / Ubuntu 22.04 / older
+# distros (glibc ranging 2.31 — 2.36). A glibc-linked binary built on a
+# newer dev VM (Ubuntu 24.04 / glibc 2.39) refuses to run on those
+# hosts ("version `GLIBC_2.39' not found"), and systemd will restart-
+# loop the service indefinitely. fix7 binary shipped with this exact
+# regression — that was the trigger for switching to a static build.
+#
+# WHAT: every `cargo build --release` (no --target flag) goes to the
+# `+crt-static` build below. The output binary at
+# target/x86_64-unknown-linux-gnu/release/accel is statically linked
+# against glibc + libelf + libbpf + zlib. `ldd` reports "not a dynamic
+# executable". It runs on any x86_64 Linux ≥ 6.4 regardless of system
+# glibc version (the binary embeds its own).
+#
+# HOST REQUIREMENTS:
+#   apt install build-essential clang pkg-config libelf-dev zlib1g-dev
+#                linux-libc-dev
+#
+# VERIFY after build:
+#   file target/x86_64-unknown-linux-gnu/release/accel
+#     → statically linked
+#   ldd target/x86_64-unknown-linux-gnu/release/accel
+#     → not a dynamic executable
+#   # Optional: confirm no GLIBC version requirements baked into the
+#   # ELF (since libc is statically linked, this list should be empty).
+#   objdump -T target/x86_64-unknown-linux-gnu/release/accel \
+#     | grep -oP 'GLIBC_[0-9.]+' | sort -V -u
+#
+# WHY NOT MUSL: tried first. Ubuntu's libelf-dev only ships glibc-ABI
+# headers / static libs; cross-compiling libbpf-sys against musl picks
+# up musl elf.h which lacks Elf64_Relr typedefs that libelf assumes,
+# and there's no apt-installable musl-compatible libelf-dev. Static
+# glibc avoids the entire libelf-musl ABI mismatch and produces the
+# same self-contained result for our use case (no DNS / no NSS /
+# no locale-dependent code paths).
+# Setting target explicitly forces cargo to compile proc-macros and
+# build scripts for the host separately (without our rustflags). Without
+# this, `+crt-static` would apply to proc-macros too and fail with
+# "cannot produce proc-macro for ... as the target does not support
+# these crate types".
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+# `+crt-static` only statically links the C runtime startup; it does
+# NOT force all `-l` libraries to be static. libbpf-sys's build script
+# adds `-lelf -lz` (and we need -lzstd because Ubuntu libelf.a uses
+# zstd-compressed sections) — by default these are picked up as .so.
+#
+# `-l:libelf.a -l:libz.a -l:libzstd.a` forces those specific archives,
+# `-C relocation-model=static -C link-arg=-static` forces the whole
+# binary into PIE-less static ELF (PIE static is fragile with libstdc++).
+# Result: `file accel` reports "statically linked", `ldd` reports
+# "not a dynamic executable", binary embeds its own glibc.
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-l:libelf.a",
+    "-C", "link-arg=-l:libz.a",
+    "-C", "link-arg=-l:libzstd.a",
+]
