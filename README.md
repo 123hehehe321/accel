@@ -2,8 +2,14 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D7 (glibc 2.34 build)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix1)
 
+- **2.5-D7 fix1**: 修复客户端命令在 systemd 启动场景找不到 socket 的问题。
+  systemd 启动的 daemon 把 socket 绑到 `/run/accel/accel.sock`,但用户从
+  shell 跑 `./accel status` 时没继承 INVOCATION_ID 环境变量,旧版本会
+  连 `./accel.sock` 失败。新版本客户端 (status / stop / algo) 会先探测
+  `/run/accel/accel.sock`,找不到再回退到 `./accel.sock`。
+  服务端逻辑不动。
 - **2.5-D7 阶段**: 生产部署 + 长跑观察。所有 Rust 接通和 BPF 程序都在
   D5/D6 已验收完成,**剩下只能跑真业务流量看实际行为**。
 - **新增源码**:
@@ -340,8 +346,8 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `859b70f1956a8bfa913d9f6d374f28e4`
-- **accel 大小**: 1,300,704 字节
+- **accel MD5**: `89916f78b5f98d38ccf39455251d8e76`
+- **accel 大小**: 1,301,216 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
-- **新增**: preflight 启动检查 + LOSSY BDP+pacing 升级
+- **新增**: preflight 启动检查 + LOSSY BDP+pacing 升级 + 客户端 socket 自动探测
