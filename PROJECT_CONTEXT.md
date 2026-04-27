@@ -183,6 +183,27 @@ cwnd 从初始低位爬升需要几分钟。期间吞吐暴跌(8 Gbps → 49 Mbp
 - LOSSY:`cwnd = BDP`(可升可降,跟随带宽);pacing = 100% bw
 - CONGEST:`cwnd = min(cwnd, BDP)`(只降不升,主动让路);pacing = 50% drain → 90% cruise
 
+### 5.13b skip_subnet 设计弯路:从 unrolled-loop 撤回到 LPM_TRIE
+
+最早 skip_subnet 的 BPF 实现是"32-entry rule 数组 + `#pragma unroll`"——简单粗暴但
+**verifier 风险高**:每个 unrolled iteration 含 family 分支(if v4 / if v6),verifier
+要展开 32 × 2 = 64 个路径组合,可能超过 1M 指令上限。即使过了,代码量也大。
+
+**正确做法**:用 BPF 内核内置的 `BPF_MAP_TYPE_LPM_TRIE`(Longest Prefix Match Trie),
+本来就是为 CIDR 匹配设计的。改完后:
+
+- BPF 代码:从 100+ 行(unroll + family + 字节序处理) → 30 行(2 次 map lookup)
+- verifier 风险:**结构性归零**(不管几条规则,都是固定 helper call 数)
+- 容量:32 → 256(可继续扩)
+- 性能:O(n) → O(log n)
+
+**通用教训**:遇到"BPF 内要遍历多条规则"的需求,**先想想内核有没有现成的 map type**。
+LPM_TRIE / HASH / LRU 等都是把数据结构复杂度推给 kernel,BPF 程序保持简单。
+"循环展开 + 数组" 是 brutal 5 秒窗口那种**真的没有现成 map** 的场景才用。
+
+**澄清:42 亿不是真跑 42 亿次**——那是 verifier 静态分析的理论路径上限,实际有剪枝。
+但即便剪到几千次,跟 LPM_TRIE 的常数次相比仍劣几个数量级。
+
 ### 5.13 编译期 + 运行期双重保护强制新算法做对的事
 
 2.5-D7 后修 bug 时引入的范式: 给所有算法一个公共头文件

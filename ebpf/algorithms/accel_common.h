@@ -4,33 +4,53 @@
  *
  * Two responsibilities:
  *
- *   1. Declare the per-algorithm `accel_skip_config` BPF map. Each
- *      algorithm gets its own copy (single-entry ARRAY, ~1.3 KB);
- *      Rust writes the same content to all of them at startup.
+ *   1. Declare two per-algorithm BPF maps of type LPM_TRIE
+ *      (Longest-Prefix-Match Trie, BPF's purpose-built data structure
+ *      for CIDR matching): `accel_skip_v4` and `accel_skip_v6`.
+ *      Rust populates them at startup from the parsed `skip_subnet`.
  *
  *   2. Provide `should_skip(sk)` that every algorithm's _init calls
- *      to decide whether this socket should bypass the algorithm
- *      (rate limiting, classification, pacing). Skipped sockets get
- *      kernel-default cong_control behaviour.
+ *      to decide whether this socket should bypass the algorithm.
+ *      Skipped sockets get kernel-default cong_control behaviour.
  *
- * SCOPE OF MATCHING
- *   * Both sk_daddr AND sk_rcv_saddr are checked against every rule.
- *     If EITHER matches, the connection is skipped. This catches
- *     client-side outbound (daddr is local), server accept sockets
- *     bound to 127.0.0.1 (saddr is local), and intra-host tunnels.
- *   * Both AF_INET and AF_INET6 supported. Rules carry the family
- *     and only match same-family sockets.
- *   * Masks are precomputed in Rust (one network-byte-order address
- *     and one bit-mask per word, both in host byte order on the wire),
- *     so the BPF program does only AND + equality compares — verifier
- *     friendly, no in-BPF conditional shifts.
+ * WHY LPM_TRIE INSTEAD OF AN ARRAY + UNROLLED LOOP
+ *   The earlier 2.5-D7 design used a 32-entry rule array with an
+ *   `#pragma unroll` linear scan inside the BPF program. That has two
+ *   structural problems:
+ *
+ *     * Verifier path explosion. Each unrolled iteration carries an
+ *       `if (family == AF_INET) {...} else if (family == AF_INET6) {...}`
+ *       branch; verifier must analyse 32 × 2 = 64 path combinations
+ *       per call. Whether it fits under the 1M-insn limit depends on
+ *       kernel-version-specific pruning behaviour — fragile.
+ *     * Hard 32-rule cap and O(n) cost per socket.
+ *
+ *   LPM_TRIE replaces both: BPF does **two** map lookups (daddr, then
+ *   saddr) — verifier sees a fixed-cost helper call. Kernel-side
+ *   trie does the longest-prefix match in O(log n). Result:
+ *
+ *     * Verifier risk: structurally zero. should_skip compiles down
+ *       to ~30 BPF insns regardless of how many rules the user
+ *       configured.
+ *     * Capacity: 256 v4 rules + 256 v6 rules (raise if needed).
+ *     * Per-socket cost at runtime: 2 trie lookups instead of a
+ *       32-iteration unrolled loop.
+ *
+ *   This is the pattern Cilium / Calico / production BPF firewalls
+ *   use; it's the BPF idiom for "match CIDR against IP".
+ *
+ * MATCHING SCOPE
+ *   Both sk_daddr AND sk_rcv_saddr are checked. If either side
+ *   matches any rule (longest prefix wins inside LPM_TRIE), the
+ *   connection is skipped.
  *
  * FORCED INCLUSION
- *   Every algorithm MUST `#include "accel_common.h"`. The Rust loader
- *   relies on each algo's skel exposing `accel_skip_config` (compile-
- *   time check via `LoadedXxx::set_skip`), and additionally `cli.rs`
- *   exhaustively matches every `LoadedAlgo` variant. A new algorithm
- *   that forgets the include cannot compile, let alone ship.
+ *   Every algorithm MUST `#include "accel_common.h"` so its skel
+ *   exposes both `accel_skip_v4` and `accel_skip_v6`. The Rust
+ *   loader's per-variant `set_skip()` references these fields by
+ *   name; a future algorithm that forgets the include can't compile,
+ *   and `cli.rs` further checks via match exhaustiveness over every
+ *   `LoadedAlgo` variant.
  */
 
 #ifndef ACCEL_COMMON_H
@@ -49,115 +69,93 @@
 #define AF_INET6 10
 #endif
 
-/* ─── Skip-rule wire layout ──────────────────────────────────────────── */
+/* ─── LPM_TRIE keys ──────────────────────────────────────────────────── */
 
-#define MAX_SKIP_RULES 32
-
-/* 40 bytes per rule. Layout matches the Rust serializer in
- * `ebpf_loader::write_skip_config()` — DO NOT REORDER without updating
- * both sides. Native byte order (kernel reads in host endianness;
- * we never serialize across machines). */
-struct skip_rule {
-	__u32 family;     /* AF_INET (2) or AF_INET6 (10) */
-	__u32 _pad;
-	__u32 addr[4];    /* host-byte-order; v4 only uses addr[0] */
-	__u32 mask[4];    /* precomputed from CIDR prefix in Rust */
+/* The kernel LPM_TRIE map type expects a key whose first 4 bytes are a
+ * `prefixlen` u32 (host byte order), followed by the address bytes in
+ * network byte order (same order they're stored in `struct sock`).
+ *
+ * The prefixlen tells the trie how many MSBs of the address are the
+ * network part. A lookup with prefixlen = 32 (v4) or 128 (v6) and the
+ * full host address returns the most-specific stored CIDR that
+ * contains that host, or NULL on no match.
+ */
+struct skip_v4_key {
+	__u32  prefixlen;
+	__be32 addr;
 };
 
-struct accel_skip_cfg {
-	__u32 count;                              /* number of valid rules in [] */
-	__u32 _pad;
-	struct skip_rule rules[MAX_SKIP_RULES];   /* 32 × 40 = 1280 bytes */
+struct skip_v6_key {
+	__u32 prefixlen;
+	__u8  addr[16];
 };
+
+#define ACCEL_SKIP_MAX_V4 256
+#define ACCEL_SKIP_MAX_V6 256
+
+/* ─── BPF maps ───────────────────────────────────────────────────────── */
 
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct accel_skip_cfg);
-} accel_skip_config SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, ACCEL_SKIP_MAX_V4);
+	__type(key, struct skip_v4_key);
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC); /* required for LPM_TRIE */
+} accel_skip_v4 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, ACCEL_SKIP_MAX_V6);
+	__type(key, struct skip_v6_key);
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} accel_skip_v6 SEC(".maps");
 
 /* ─── Match logic ────────────────────────────────────────────────────── */
-
-/* Returns 1 iff `addr_h` (host byte order) falls inside the rule's
- * IPv4 subnet. The rule is assumed to have family == AF_INET. */
-static __always_inline int match_v4_addr(__u32 addr_h, const struct skip_rule *r)
-{
-	return (addr_h & r->mask[0]) == (r->addr[0] & r->mask[0]);
-}
-
-/* Returns 1 iff the IPv6 address (4× host-byte-order words) falls
- * inside the rule's subnet. The rule is assumed to have family ==
- * AF_INET6. */
-static __always_inline int match_v6_addr(const __u32 addr_h[4],
-					 const struct skip_rule *r)
-{
-	return (addr_h[0] & r->mask[0]) == (r->addr[0] & r->mask[0])
-	    && (addr_h[1] & r->mask[1]) == (r->addr[1] & r->mask[1])
-	    && (addr_h[2] & r->mask[2]) == (r->addr[2] & r->mask[2])
-	    && (addr_h[3] & r->mask[3]) == (r->addr[3] & r->mask[3]);
-}
-
-/* Check both daddr and saddr of `sk` against `r`. Returns 1 on hit. */
-static __always_inline int rule_hits_socket(struct sock *sk,
-					    const struct skip_rule *r)
-{
-	__u16 family = sk->__sk_common.skc_family;
-	if ((__u32)family != r->family)
-		return 0;
-
-	if (family == AF_INET) {
-		__u32 d = bpf_ntohl(sk->__sk_common.skc_daddr);
-		__u32 s = bpf_ntohl(sk->__sk_common.skc_rcv_saddr);
-		return match_v4_addr(d, r) || match_v4_addr(s, r);
-	}
-
-	if (family == AF_INET6) {
-		const __be32 *d_be =
-			sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32;
-		const __be32 *s_be =
-			sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32;
-		__u32 d_h[4] = {
-			bpf_ntohl(d_be[0]), bpf_ntohl(d_be[1]),
-			bpf_ntohl(d_be[2]), bpf_ntohl(d_be[3]),
-		};
-		__u32 s_h[4] = {
-			bpf_ntohl(s_be[0]), bpf_ntohl(s_be[1]),
-			bpf_ntohl(s_be[2]), bpf_ntohl(s_be[3]),
-		};
-		return match_v6_addr(d_h, r) || match_v6_addr(s_h, r);
-	}
-
-	return 0;
-}
 
 /* The single entry-point each algorithm calls from its _init callback.
  * Returns 1 → caller should set its priv->skip flag and short-circuit
  * all per-ACK work. Returns 0 → algorithm proceeds normally.
  *
- * Iteration is statically unrolled with constant indices because v6.12
- * verifier rejects variable offsets on PTR_TO_MAP_VALUE. The `i >= count`
- * break gives early termination once all real rules have been checked.
+ * NO LOOPS. NO UNROLLING. Up to 2 LPM_TRIE lookups (daddr then saddr)
+ * per family. Verifier sees fixed-cost helper calls.
  */
 static __always_inline int should_skip(struct sock *sk)
 {
-	__u32 zero = 0;
-	struct accel_skip_cfg *cfg =
-		bpf_map_lookup_elem(&accel_skip_config, &zero);
-	if (!cfg)
-		return 0;
+	__u16 family = sk->__sk_common.skc_family;
 
-	__u32 count = cfg->count;
-	if (count > MAX_SKIP_RULES)
-		count = MAX_SKIP_RULES; /* defensive bound for verifier */
-
-	#pragma unroll
-	for (int i = 0; i < MAX_SKIP_RULES; i++) {
-		if ((__u32)i >= count)
-			break;
-		if (rule_hits_socket(sk, &cfg->rules[i]))
+	if (family == AF_INET) {
+		struct skip_v4_key key = {
+			.prefixlen = 32,
+			.addr      = sk->__sk_common.skc_daddr,
+		};
+		if (bpf_map_lookup_elem(&accel_skip_v4, &key))
 			return 1;
+		key.addr = sk->__sk_common.skc_rcv_saddr;
+		if (bpf_map_lookup_elem(&accel_skip_v4, &key))
+			return 1;
+		return 0;
 	}
+
+	if (family == AF_INET6) {
+		struct skip_v6_key key = { .prefixlen = 128 };
+		__builtin_memcpy(
+			key.addr,
+			sk->__sk_common.skc_v6_daddr.in6_u.u6_addr8,
+			16);
+		if (bpf_map_lookup_elem(&accel_skip_v6, &key))
+			return 1;
+		__builtin_memcpy(
+			key.addr,
+			sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8,
+			16);
+		if (bpf_map_lookup_elem(&accel_skip_v6, &key))
+			return 1;
+		return 0;
+	}
+
+	/* Other families (AF_UNIX etc.) shouldn't be running TCP cong
+	 * control; defensively treat as non-local. */
 	return 0;
 }
 

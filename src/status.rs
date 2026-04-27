@@ -59,7 +59,7 @@ pub struct State {
     /// (a freshly-loaded BPF map starts empty — every connection
     /// would match no rule and get rate-limited, including local /
     /// intranet traffic). All algorithms get the same rule list.
-    pub skip_rules: Vec<crate::ebpf_loader::SkipRule>,
+    pub skip_rules: crate::ebpf_loader::SkipRules,
     pub health_shutting_down: AtomicBool,
     pub health_last_ok: Mutex<Option<Instant>>,
     pub jit_warned: AtomicBool,

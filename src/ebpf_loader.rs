@@ -70,8 +70,8 @@ impl LoadedCubic {
     /// future algorithm that forgets `#include "accel_common.h"` won't
     /// have the map, won't compile here, and accel won't ship. See
     /// `ebpf/algorithms/accel_common.h` for the full rationale.
-    pub fn set_skip(&mut self, rules: &[SkipRule]) -> Result<()> {
-        write_skip_config(&mut self.skel.maps.accel_skip_config, rules, "accel_cubic")
+    pub fn set_skip(&mut self, rules: &SkipRules) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_v4, &mut self.skel.maps.accel_skip_v6, rules, "accel_cubic")
     }
 }
 
@@ -104,8 +104,8 @@ impl LoadedBrutal {
 
     /// Write the skip-local flag into the algorithm's `accel_skip_config`
     /// BPF map. See `LoadedCubic::set_skip` doc.
-    pub fn set_skip(&mut self, rules: &[SkipRule]) -> Result<()> {
-        write_skip_config(&mut self.skel.maps.accel_skip_config, rules, "accel_brutal")
+    pub fn set_skip(&mut self, rules: &SkipRules) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_v4, &mut self.skel.maps.accel_skip_v6, rules, "accel_brutal")
     }
 
     /// Read the current count of accel_brutal-managed sockets from the
@@ -191,8 +191,8 @@ unsafe impl Send for LoadedSmart {}
 impl LoadedSmart {
     /// Write the skip-local flag into the algorithm's `accel_skip_config`
     /// BPF map. See `LoadedCubic::set_skip` doc.
-    pub fn set_skip(&mut self, rules: &[SkipRule]) -> Result<()> {
-        write_skip_config(&mut self.skel.maps.accel_skip_config, rules, "accel_smart")
+    pub fn set_skip(&mut self, rules: &SkipRules) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_v4, &mut self.skel.maps.accel_skip_v6, rules, "accel_smart")
     }
 
     /// Write the user-configured GOOD-state target rate (byte/s) and
@@ -501,83 +501,124 @@ fn load_smart() -> Result<LoadedAlgo> {
     }))
 }
 
-/// One parsed, ready-to-ship skip rule. `family` is `libc::AF_INET` (2)
-/// or `libc::AF_INET6` (10). `addr` and `mask` are 4 host-byte-order
-/// u32 words; for IPv4, only `[0]` carries the address/mask, the
-/// remaining three words are zero.
+/// IPv4 skip-list entry. `addr_be` is the network address in network
+/// byte order (4 bytes); `prefixlen` is 0..=32. The pair forms the
+/// LPM_TRIE key (with prefixlen as a u32 prefix).
 #[derive(Clone, Copy, Debug)]
-pub struct SkipRule {
-    pub family: u32,
-    pub addr: [u32; 4],
-    pub mask: [u32; 4],
+pub struct V4Rule {
+    pub addr_be: [u8; 4],
+    pub prefixlen: u32,
 }
 
-/// Maximum number of skip rules accepted. Mirrors `MAX_SKIP_RULES` in
-/// `ebpf/algorithms/accel_common.h` — the BPF-side ARRAY map reserves
-/// exactly this many slots.
-pub const MAX_SKIP_RULES: usize = 32;
+/// IPv6 skip-list entry. `addr_be` is the address in network byte order
+/// (16 bytes); `prefixlen` is 0..=128.
+#[derive(Clone, Copy, Debug)]
+pub struct V6Rule {
+    pub addr_be: [u8; 16],
+    pub prefixlen: u32,
+}
 
-/// Wire size of `struct accel_skip_cfg` in accel_common.h. Layout:
-///     u32 count          // bytes 0..4
-///     u32 _pad           //       4..8
-///     skip_rule[32]      //       8..1288    (40 bytes per rule)
-const SKIP_CFG_BYTES: usize = 8 + MAX_SKIP_RULES * 40;
+/// Parsed skip_subnet split by family. Both lists are pushed to
+/// LPM_TRIE maps in the kernel; per-family separation matches the
+/// `accel_skip_v4` / `accel_skip_v6` BPF map split (see
+/// `ebpf/algorithms/accel_common.h`).
+#[derive(Clone, Debug, Default)]
+pub struct SkipRules {
+    pub v4: Vec<V4Rule>,
+    pub v6: Vec<V6Rule>,
+}
 
-/// Write a list of skip rules into one algorithm's `accel_skip_config`
-/// BPF map. Called by every `LoadedXxx::set_skip()`.
+/// Capacities mirror `ACCEL_SKIP_MAX_V4` / `ACCEL_SKIP_MAX_V6` in
+/// `accel_common.h`.
+pub const MAX_SKIP_V4: usize = 256;
+pub const MAX_SKIP_V6: usize = 256;
+
+/// Push the skip rules into one algorithm's `accel_skip_v4` and
+/// `accel_skip_v6` LPM_TRIE maps. Called by every `LoadedXxx::set_skip()`.
 ///
-/// The map type is plumbed as a generic `MapMut` so this helper works
-/// for any algorithm's skeleton — calling it on a skel that doesn't
-/// declare `accel_skip_config` is a Rust *compile* error (the
-/// `skel.maps.accel_skip_config` field simply won't exist), which is
-/// the strongest form of "force every algorithm to include
-/// accel_common.h" we can get.
+/// LPM_TRIE doesn't have an atomic "replace all entries" primitive, so
+/// the helper does:
+///   1. enumerate every existing key in v4 map → delete each
+///   2. insert each rule from `rules.v4`
+///   3. same for v6
+///
+/// Iteration is safe because `keys()` snapshots key-by-key via
+/// `bpf_map_get_next_key()`; we collect into a Vec first to avoid
+/// invalidating the iterator while mutating.
+///
+/// The two map handles are plumbed in by name so that a future
+/// algorithm without `accel_skip_v4` / `accel_skip_v6` (i.e. that
+/// forgot to `#include "accel_common.h"`) is a Rust *compile* error.
 fn write_skip_config(
-    map: &mut libbpf_rs::MapMut<'_>,
-    rules: &[SkipRule],
+    v4_map: &mut libbpf_rs::MapMut<'_>,
+    v6_map: &mut libbpf_rs::MapMut<'_>,
+    rules: &SkipRules,
     algo_name: &str,
 ) -> Result<()> {
-    if rules.len() > MAX_SKIP_RULES {
+    if rules.v4.len() > MAX_SKIP_V4 {
         bail!(
-            "too many skip rules ({}); max is {}",
-            rules.len(),
-            MAX_SKIP_RULES
+            "too many IPv4 skip rules ({}); max is {}",
+            rules.v4.len(),
+            MAX_SKIP_V4
+        );
+    }
+    if rules.v6.len() > MAX_SKIP_V6 {
+        bail!(
+            "too many IPv6 skip rules ({}); max is {}",
+            rules.v6.len(),
+            MAX_SKIP_V6
         );
     }
 
-    let mut buf = [0u8; SKIP_CFG_BYTES];
-    // count at byte 0..4
-    let count = rules.len() as u32;
-    buf[0..4].copy_from_slice(&count.to_ne_bytes());
-    // _pad at 4..8 stays zero
-
-    // rules at 8..  — each rule is 40 bytes:
-    //   u32 family   (offset 0..4 of the rule)
-    //   u32 _pad     (4..8)
-    //   u32 addr[4]  (8..24)
-    //   u32 mask[4]  (24..40)
-    for (i, rule) in rules.iter().enumerate() {
-        let base = 8 + i * 40;
-        buf[base..base + 4].copy_from_slice(&rule.family.to_ne_bytes());
-        // pad at base+4..base+8 stays zero
-        for w in 0..4 {
-            let off = base + 8 + w * 4;
-            buf[off..off + 4].copy_from_slice(&rule.addr[w].to_ne_bytes());
-        }
-        for w in 0..4 {
-            let off = base + 24 + w * 4;
-            buf[off..off + 4].copy_from_slice(&rule.mask[w].to_ne_bytes());
-        }
+    // ── v4: clear, then insert ─────────────────────────────────────
+    let stale_v4: Vec<Vec<u8>> = v4_map.keys().collect();
+    for key in stale_v4 {
+        v4_map.delete(&key).with_context(|| {
+            format!("clearing accel_skip_v4 entry for {algo_name}")
+        })?;
+    }
+    for rule in &rules.v4 {
+        // LPM_TRIE v4 key layout: u32 prefixlen (host order) + 4 bytes
+        // addr (network order). Total 8 bytes. Wire layout matches
+        // `struct skip_v4_key` in accel_common.h.
+        let mut key = [0u8; 8];
+        key[0..4].copy_from_slice(&rule.prefixlen.to_ne_bytes());
+        key[4..8].copy_from_slice(&rule.addr_be);
+        let value = [1u8; 1]; // value unused; presence indicates "skip"
+        v4_map
+            .update(&key, &value, MapFlags::ANY)
+            .with_context(|| {
+                format!(
+                    "inserting v4 skip rule (prefixlen={}) for {algo_name}",
+                    rule.prefixlen
+                )
+            })?;
     }
 
-    let key: u32 = 0;
-    map.update(&key.to_ne_bytes(), &buf, MapFlags::ANY)
-        .with_context(|| {
-            format!(
-                "writing accel_skip_config ({} rules) for {algo_name}",
-                rules.len()
-            )
-        })
+    // ── v6: clear, then insert ─────────────────────────────────────
+    let stale_v6: Vec<Vec<u8>> = v6_map.keys().collect();
+    for key in stale_v6 {
+        v6_map.delete(&key).with_context(|| {
+            format!("clearing accel_skip_v6 entry for {algo_name}")
+        })?;
+    }
+    for rule in &rules.v6 {
+        // LPM_TRIE v6 key layout: u32 prefixlen + 16 bytes addr (BE).
+        let mut key = [0u8; 20];
+        key[0..4].copy_from_slice(&rule.prefixlen.to_ne_bytes());
+        key[4..20].copy_from_slice(&rule.addr_be);
+        let value = [1u8; 1];
+        v6_map
+            .update(&key, &value, MapFlags::ANY)
+            .with_context(|| {
+                format!(
+                    "inserting v6 skip rule (prefixlen={}) for {algo_name}",
+                    rule.prefixlen
+                )
+            })?;
+    }
+
+    Ok(())
 }
 
 /// Build-time probe printed during startup banner — confirms both

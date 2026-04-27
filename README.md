@@ -643,7 +643,7 @@ connections:
   smart state:       GOOD 40 (88%) | LOSSY 4 (8%) | CONGEST 1 (2%)
 ```
 
-### 9.5.6 不加速的网段(skip_subnet,2.5 后修)
+### 9.5.6 不加速的网段(skip_subnet,2.5 后修,LPM_TRIE 实现)
 
 `acc.conf` 顶层 `skip_subnet` 是必填字段,逗号分隔的 CIDR 列表。匹配
 到的 TCP 连接不被加速算法限速,走 kernel 默认行为。**目的地址**和
@@ -671,10 +671,13 @@ skip_subnet = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/1
 - prefix 范围:IPv4 0..=32,IPv6 0..=128。
 - 必填:字段不存在 → bail。空字符串 `""` 表示**所有 TCP 都走加速**
   (含回环,99% 场景不该这样)。
+- 容量:IPv4 256 条 + IPv6 256 条(LPM_TRIE 实际不限,代码端硬编码为安全上限)。
 
 **实现机制**(五层保护,新算法不会遗漏):
-1. **公共头** `ebpf/algorithms/accel_common.h` 声明 `accel_skip_config`
-   BPF map (1.3 KB,32 条 × 40 字节规则 + count) + `should_skip()` 内联
+1. **公共头** `ebpf/algorithms/accel_common.h` 声明 `accel_skip_v4`
+   + `accel_skip_v6` BPF maps(`BPF_MAP_TYPE_LPM_TRIE`,容量各 256 条
+   规则)+ `should_skip()` 内联(2 次 map lookup,无循环、无 unroll、
+   verifier 风险结构性归零)
 2. **每个算法 `_init`** 调 `should_skip(sk)` 检测内网,若是设 priv->skip=1
    直接 return,**也不计入 socket_count**(状态计数只反映被实际加速的
    WAN 连接)
