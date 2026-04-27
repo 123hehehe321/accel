@@ -2,7 +2,19 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix5)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix6)
+
+- **2.5-D7 fix6 (上限放宽 + 死代码清理)**:
+  - **`duplicate_factor` 上限 8 → 100**。极端环境(卫星 / 严重退化的
+    移动链路)允许设到 100 倍。BPF 端 `#pragma unroll` 静态展开,
+    100 次循环 ~500 BPF 指令,远低于 1M verifier 上限。
+  - **死代码清理**: 删除 `accel_brutal.bpf.c` 里定义但未引用的
+    `max_t` 宏;修复 `cli.rs` 一处冗余 `clone()`;修复
+    `incidents::path().unwrap()` 改用 `if let Some` 防御。
+  - **审计 PASS**: 全部源码过 `clippy -D warnings -D dead_code -D
+    unused_imports`,无警告。
+
+## 历史版本: 2.5-smart-D7 (fix5)
 
 - **2.5-D7 fix5 (smart 算法精简 + 多倍发包可配 + 计数显示稳健化)**:
   用户实测 VPN/4K 直播加速时 smart 表现远不如 brutal,status 显示
@@ -406,8 +418,8 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `2fd644e0fd1c7a32308cec3b3528b744`
-- **accel 大小**: 1,323,000 字节
+- **accel MD5**: `09f9d7cdac0428492279359b47d6a9a5`
+- **accel 大小**: 1,322,936 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
 - **新增**: preflight 启动检查 + LOSSY BDP+pacing + 客户端 socket 自动探测 + skip_subnet 用 LPM_TRIE + 计数器 PERCPU_ARRAY 修下溢
