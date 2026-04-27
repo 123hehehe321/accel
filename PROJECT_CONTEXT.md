@@ -390,6 +390,16 @@ skip 机制(fix3+fix4):
 - BPF 端用 `BPF_MAP_TYPE_LPM_TRIE`(2 次 lookup,O(log n))
 - 命中则**不走 accel 算法**(daddr 或 saddr 任意一个匹配即跳过)
 
+作用域分层(必读,新会话常误解):
+- **算法本体 = 每连接独立**。cwnd / pacing / 状态机都是 per-sock,一条
+  进 CONGEST 不影响其他连接。
+- **多倍发包 = 全局开关 + 端口范围**。`smart_link_state` 是单格 map,
+  任意 sock 转 LOSSY 就把全局 flag 写成 LOSSY,tc-bpf 给所有匹配
+  `duplicate_ports` 端口的 TCP 包克隆。端口范围内的 GOOD 连接也会被
+  一起克隆 → 用户配 `duplicate_ports` 时只填业务端口,别开放整个范围。
+- **为何不做 per-sock dup**:tc-bpf 在 egress 拿不到 sock pointer,精确
+  方案要 5-tuple + sock_storage map,verifier 风险跳一档,当前简化够用。
+
 ---
 
 ## 8. 验收脚本(binaries 分支)
