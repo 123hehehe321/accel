@@ -46,13 +46,30 @@ struct {
 	__type(value, __u32);
 } smart_link_state SEC(".maps");
 
-/* Duplication parameters. Userspace (D5 acc.conf parser) writes once at
- * startup. port_min == 0 means "no port filter" (clone every TCP packet
- * during LOSSY). */
+/* Hard upper bound on packet multiplier: each LOSSY-state TCP packet
+ * is sent up to MAX_DUP_FACTOR copies in total (1 = no clone, 2 =
+ * original + 1 clone, ..., 8 = original + 7 clones). The BPF clone
+ * loop is statically unrolled to MAX_DUP_FACTOR iterations so the
+ * verifier sees a fixed instruction count regardless of user setting.
+ *
+ * 8 is chosen as a sane ceiling: more than 8× quickly saturates the
+ * underlying link and triggers real congestion. If you legitimately
+ * need more, raise this constant — the cost is just a few extra
+ * unrolled BPF instructions. */
+#define MAX_DUP_FACTOR 8
+
+/* Duplication parameters. Userspace writes once at startup.
+ *   ifindex     — egress interface to clone onto (must be the same
+ *                 interface the tc-bpf is attached to).
+ *   port_min/max— optional dport filter; 0 disables filtering.
+ *   multiplier  — total copies per LOSSY-state TCP packet. Range
+ *                 1..=MAX_DUP_FACTOR; 1 disables cloning (degrades
+ *                 to a transparent fast path). */
 struct dup_config {
 	__u32 ifindex;
 	__u16 port_min;
 	__u16 port_max;
+	__u32 multiplier;
 };
 
 struct {
@@ -125,10 +142,26 @@ int smart_dup(struct __sk_buff *skb)
 			return TC_ACT_OK;
 	}
 
-	/* Clone-and-redirect the packet onto the same interface's egress.
-	 * The original skb continues normal transmission (we still return
-	 * TC_ACT_OK). flags=0 means "egress on the target ifindex". */
-	bpf_clone_redirect(skb, cfg->ifindex, 0);
+	/* Send (multiplier - 1) clones in addition to the original packet.
+	 * multiplier == 1: no clones (degenerate fast path; should normally
+	 * be disabled by setting smart_link_state away from LOSSY upstream,
+	 * but we honour it here for completeness). multiplier == N: original
+	 * + (N-1) clones, total N copies on the wire.
+	 *
+	 * The loop is statically unrolled to MAX_DUP_FACTOR with a constant
+	 * upper bound; verifier sees a fixed cost regardless of user-chosen
+	 * multiplier. Each `bpf_clone_redirect()` invocation is independent.
+	 */
+	__u32 m = cfg->multiplier;
+	if (m == 0) m = 1;
+	if (m > MAX_DUP_FACTOR) m = MAX_DUP_FACTOR;
+
+	#pragma unroll
+	for (int i = 1; i < MAX_DUP_FACTOR; i++) {
+		if ((__u32)i >= m)
+			break;
+		bpf_clone_redirect(skb, cfg->ifindex, 0);
+	}
 
 	return TC_ACT_OK;
 }

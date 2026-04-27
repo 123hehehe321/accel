@@ -272,6 +272,12 @@ fn run_server() -> Result<()> {
         let ifindex = read_ifindex(&smart_cfg.interface)?;
         let (port_min, port_max) = parse_port_range(&smart_cfg.duplicate_ports)?;
         let rate_bytes = smart_cfg.rate_mbps as u64 * 1_000_000 / 8;
+        if !(1..=8).contains(&smart_cfg.duplicate_factor) {
+            bail!(
+                "acc.conf: [smart].duplicate_factor must be in 1..=8 (got {})",
+                smart_cfg.duplicate_factor
+            );
+        }
 
         match loaded_algos
             .get_mut(&target_name)
@@ -282,9 +288,13 @@ fn run_server() -> Result<()> {
                     rate_bytes,
                     smart_cfg.loss_lossy_bp,
                     smart_cfg.loss_congest_bp,
-                    smart_cfg.rtt_congest_pct,
                 )?;
-                sm.set_dup_config(ifindex, port_min, port_max)?;
+                sm.set_dup_config(
+                    ifindex,
+                    port_min,
+                    port_max,
+                    smart_cfg.duplicate_factor,
+                )?;
                 sm.attach_tc_egress(ifindex)?;
             }
             LoadedAlgo::Cubic(_) | LoadedAlgo::Brutal(_) => unreachable!(
@@ -296,8 +306,12 @@ fn run_server() -> Result<()> {
             smart_cfg.rate_mbps, smart_cfg.interface, ifindex
         );
         println!(
-            "  smart thresholds: lossy={}bp congest={}bp rtt={}%",
-            smart_cfg.loss_lossy_bp, smart_cfg.loss_congest_bp, smart_cfg.rtt_congest_pct
+            "  smart thresholds: lossy={}bp congest={}bp (loss-only classification)",
+            smart_cfg.loss_lossy_bp, smart_cfg.loss_congest_bp
+        );
+        println!(
+            "  smart dup factor: {}x (LOSSY: each TCP packet sent {} times)",
+            smart_cfg.duplicate_factor, smart_cfg.duplicate_factor
         );
         if port_min > 0 {
             println!("  smart dup ports: {port_min}-{port_max}");
@@ -311,9 +325,9 @@ fn run_server() -> Result<()> {
             ifindex,
             loss_lossy_bp: smart_cfg.loss_lossy_bp,
             loss_congest_bp: smart_cfg.loss_congest_bp,
-            rtt_congest_pct: smart_cfg.rtt_congest_pct,
             port_min,
             port_max,
+            duplicate_factor: smart_cfg.duplicate_factor,
         })
     } else {
         None

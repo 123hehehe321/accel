@@ -74,18 +74,24 @@ skip_subnet = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/1
 #                    "" 或省略 = 不过滤 (LOSSY 状态下所有 TCP 端口都克隆)。
 #                    强烈建议填: 仅克隆业务端口, 让 SSH/DNS 等管理流量
 #                    不受 LOSSY 状态多倍发包影响。
+#   duplicate_factor LOSSY 状态下每个 TCP 包发几份。范围 1..=8。
+#                    1 = 不克隆(等于关掉冗余补偿)
+#                    2 = 默认,原包 + 1 份克隆,链路占用 2x
+#                    3+ = 更激进,丢包高时可考虑;但超过 5 容易反过来打爆链路
 #   loss_lossy_bp    丢包率 ≥ 此值 (basis points; 100 = 1%) → LOSSY 状态。默认 100。
 #   loss_congest_bp  丢包率 ≥ 此值 → CONGEST 状态 (主动让路)。默认 1500 = 15%。
-#   rtt_congest_pct  RTT 膨胀 ≥ 此百分比 → CONGEST 状态。默认 50 (= srtt/min_rtt ≥ 1.5)。
+#
+# 注:smart 已不再用 RTT 比例做状态判断 (隧道/VPN 场景下 srtt 天然
+# 远高于 min_rtt,会误触发 CONGEST)。fix5 起改为纯丢包判定。
 #
 # 选 smart 时取消下面整段的注释,根据需要调:
 #[smart]
 #rate_mbps = 100
 #interface = "eth0"
 #duplicate_ports = "5500-20000"
+#duplicate_factor = 2
 #loss_lossy_bp = 100
 #loss_congest_bp = 1500
-#rtt_congest_pct = 50
 
 
 # ─── runtime ─────────────────────────────────────────────────

@@ -135,13 +135,15 @@ fn reload_one(state: &State, name: &str) {
                         saved.rate_bytes,
                         saved.loss_lossy_bp,
                         saved.loss_congest_bp,
-                        saved.rtt_congest_pct,
                     ) {
                         eprintln!("health: re-apply smart config after reload failed: {e:#}");
                     }
-                    if let Err(e) =
-                        sm.set_dup_config(saved.ifindex, saved.port_min, saved.port_max)
-                    {
+                    if let Err(e) = sm.set_dup_config(
+                        saved.ifindex,
+                        saved.port_min,
+                        saved.port_max,
+                        saved.duplicate_factor,
+                    ) {
                         eprintln!("health: re-apply smart dup_config after reload failed: {e:#}");
                     }
                     if let Err(e) = sm.attach_tc_egress(saved.ifindex) {

@@ -202,21 +202,21 @@ impl LoadedSmart {
         rate_bytes_per_sec: u64,
         loss_lossy_bp: u32,
         loss_congest_bp: u32,
-        rtt_congest_pct: u32,
     ) -> Result<()> {
         // Wire layout matches `struct smart_config` in
-        // accel_smart.bpf.c (24 bytes, native endian — kernel reads in
+        // accel_smart.bpf.c (16 bytes, native endian — kernel reads in
         // host byte order; we never serialize across machines):
         //   __u64 rate;            // bytes 0..8
         //   __u32 loss_lossy_bp;   //       8..12
         //   __u32 loss_congest_bp; //      12..16
-        //   __u32 rtt_congest_pct; //      16..20
-        //   __u32 _pad;            //      20..24
-        let mut buf = [0u8; 24];
+        //
+        // RTT-based dispatch was removed in fix5 (see BPF struct
+        // comment for rationale: stale tcp_min_rtt + tunnel queueing
+        // produced false-positive CONGEST in real cross-border traffic).
+        let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&rate_bytes_per_sec.to_ne_bytes());
         buf[8..12].copy_from_slice(&loss_lossy_bp.to_ne_bytes());
         buf[12..16].copy_from_slice(&loss_congest_bp.to_ne_bytes());
-        buf[16..20].copy_from_slice(&rtt_congest_pct.to_ne_bytes());
 
         let key: u32 = 0;
         self.skel
@@ -226,8 +226,7 @@ impl LoadedSmart {
             .with_context(|| {
                 format!(
                     "writing smart_config_map (rate={rate_bytes_per_sec} byte/s, \
-                     lossy={loss_lossy_bp}bp, congest={loss_congest_bp}bp, \
-                     rtt_pct={rtt_congest_pct})"
+                     lossy={loss_lossy_bp}bp, congest={loss_congest_bp}bp)"
                 )
             })
     }
@@ -239,16 +238,21 @@ impl LoadedSmart {
         ifindex: u32,
         port_min: u16,
         port_max: u16,
+        multiplier: u32,
     ) -> Result<()> {
         // Wire layout matches `struct dup_config` in
-        // accel_smart_dup.bpf.c (8 bytes, native endian):
-        //   __u32 ifindex;   // bytes 0..4
-        //   __u16 port_min;  //       4..6
-        //   __u16 port_max;  //       6..8
-        let mut buf = [0u8; 8];
+        // accel_smart_dup.bpf.c (12 bytes + 4 alignment pad, native
+        // endian):
+        //   __u32 ifindex;     // bytes 0..4
+        //   __u16 port_min;    //       4..6
+        //   __u16 port_max;    //       6..8
+        //   __u32 multiplier;  //       8..12 (1..=8; clamped BPF-side)
+        //   (struct alignment to 4 → no trailing pad)
+        let mut buf = [0u8; 12];
         buf[0..4].copy_from_slice(&ifindex.to_ne_bytes());
         buf[4..6].copy_from_slice(&port_min.to_ne_bytes());
         buf[6..8].copy_from_slice(&port_max.to_ne_bytes());
+        buf[8..12].copy_from_slice(&multiplier.to_ne_bytes());
 
         let key: u32 = 0;
         self.dup_skel
@@ -258,7 +262,8 @@ impl LoadedSmart {
             .with_context(|| {
                 format!(
                     "writing smart_dup_config (ifindex={ifindex}, \
-                     port_min={port_min}, port_max={port_max})"
+                     port_min={port_min}, port_max={port_max}, \
+                     multiplier={multiplier})"
                 )
             })
     }

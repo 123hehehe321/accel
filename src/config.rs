@@ -71,9 +71,16 @@ pub struct SmartConfig {
     #[serde(default)]
     pub duplicate_ports: String,
 
+    /// LOSSY-state packet multiplier — total copies per outbound TCP
+    /// packet (1 = original only / no clone, 2 = original + 1 clone,
+    /// up to 8). Hard upper bound 8 because higher factors saturate
+    /// the link and trigger real congestion. Default 2.
+    #[serde(default = "default_duplicate_factor")]
+    pub duplicate_factor: u32,
+
     /// Loss-rate threshold above which the link is classified as LOSSY
     /// (basis points; 100 = 1%). Default tuned for typical cross-border
-    /// links per design §7.
+    /// links.
     #[serde(default = "default_loss_lossy_bp")]
     pub loss_lossy_bp: u32,
 
@@ -81,11 +88,6 @@ pub struct SmartConfig {
     /// CONGEST (basis points; 1500 = 15%).
     #[serde(default = "default_loss_congest_bp")]
     pub loss_congest_bp: u32,
-
-    /// RTT-inflation threshold (percent over min_rtt) above which the
-    /// link is classified as CONGEST. Default 50 (= srtt ≥ 1.5 × min).
-    #[serde(default = "default_rtt_congest_pct")]
-    pub rtt_congest_pct: u32,
 }
 
 fn default_loss_lossy_bp() -> u32 {
@@ -94,8 +96,8 @@ fn default_loss_lossy_bp() -> u32 {
 fn default_loss_congest_bp() -> u32 {
     1500
 }
-fn default_rtt_congest_pct() -> u32 {
-    50
+fn default_duplicate_factor() -> u32 {
+    2
 }
 
 #[derive(Debug, Deserialize)]

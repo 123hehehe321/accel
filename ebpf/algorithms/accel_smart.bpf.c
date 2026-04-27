@@ -91,14 +91,21 @@ struct {
 	__type(value, __u32);
 } smart_link_state SEC(".maps");
 
-/* Userspace-managed tunables. Read every ACK, written by Rust at startup
- * (and by future AI tuning paths — see design §14). */
+/* Userspace-managed tunables. Read every ACK, written by Rust at startup.
+ *
+ * Loss-only classification: smart used to also factor in RTT inflation
+ * (`srtt / min_rtt`) for the CONGEST decision, but real-world VPN /
+ * cross-border traffic exposed two structural weaknesses:
+ *   1. tcp_min_rtt() can be stale (locked to the handshake's lightly-
+ *      loaded RTT for the entire connection lifetime), making the
+ *      ratio permanently large under sustained load.
+ *   2. Tunnel queueing inflates srtt independently of real congestion
+ *      → false positives → smart unnecessarily backs off.
+ * Removed in fix5; classification is now strictly loss-based. */
 struct smart_config {
 	__u64 rate;            /* byte/sec */
-	__u32 loss_lossy_bp;   /* default 100 (1%) */
-	__u32 loss_congest_bp; /* default 1500 (15%) */
-	__u32 rtt_congest_pct; /* default 50 */
-	__u32 _pad;
+	__u32 loss_lossy_bp;   /* default 100 (1%) → LOSSY */
+	__u32 loss_congest_bp; /* default 1500 (15%) → CONGEST */
 };
 
 struct {
@@ -226,24 +233,24 @@ static __always_inline void smart_update_ewma(struct smart_priv *p,
 
 /* ─── Classification ──────────────────────────────────────────────────── */
 
+/* Loss-only classifier (see smart_config struct comment for why RTT-based
+ * dispatch was removed in fix5). Three bands:
+ *
+ *     loss_ewma_bp                     state
+ *     ─────────────────────────────────────────
+ *     ≥ loss_congest_bp                CONGEST
+ *     ≥ loss_lossy_bp                  LOSSY
+ *     < loss_lossy_bp / 2              GOOD
+ *     in [loss_lossy_bp/2, loss_lossy_bp): hysteresis band — keep
+ *                                      current state to prevent flapping
+ */
 static __always_inline __u32 smart_classify(const struct smart_priv *p,
-					    const struct smart_config *cfg,
-					    __u32 srtt_us, __u32 min_rtt_us)
+					    const struct smart_config *cfg)
 {
-	/* RTT inflation: srtt / min_rtt − 1, expressed as (ratio × 100). */
-	__u32 rtt_ratio = 100;
-	if (min_rtt_us > 0)
-		rtt_ratio = (__u32)((__u64)srtt_us * 100 / min_rtt_us);
-
-	/* Single strong signal → CONGEST (safety first). */
 	if (p->loss_ewma_bp >= cfg->loss_congest_bp)
 		return LINK_CONGEST;
-	if (rtt_ratio >= 100 + cfg->rtt_congest_pct)
-		return LINK_CONGEST;
 
-	/* Lossy but RTT stable → noise-style loss. */
-	if (p->loss_ewma_bp >= cfg->loss_lossy_bp &&
-	    rtt_ratio < 100 + cfg->rtt_congest_pct)
+	if (p->loss_ewma_bp >= cfg->loss_lossy_bp)
 		return LINK_LOSSY;
 
 	/* Definitely clean: well below LOSSY threshold (hysteresis floor). */
@@ -496,10 +503,8 @@ __u32 BPF_PROG(smart_main, struct sock *sk, __u32 ack, int flag,
 	smart_aggregate(p, sec, &acked_total, &losses_total);
 	smart_update_ewma(p, acked_total, losses_total);
 
-	/* 3. Classify. */
-	__u32 srtt_us = tp->srtt_us >> 3;
-	__u32 min_rtt = tcp_min_rtt_us(tp);
-	__u32 new_state = smart_classify(p, cfg, srtt_us, min_rtt);
+	/* 3. Classify (loss-only since fix5). */
+	__u32 new_state = smart_classify(p, cfg);
 
 	/* 4. Apply minimum-dwell hysteresis (200ms). On transition, swap the
 	 *    per-state population counters and update the global link_state
