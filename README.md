@@ -2,8 +2,16 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix1)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix2)
 
+- **2.5-D7 fix2**: 内网/回环连接绕过加速算法 — `acc.conf` 顶层加
+  `skip_local = true` (默认 true)。回环 + RFC1918 + IPv6 ULA 范围的
+  TCP 连接不被 brutal/smart 限速,走内核默认行为。
+  smart 不再因为局域网零 RTT 误判 CONGEST。
+  **三层保护**: 公共头 `accel_common.h` 强制每个算法 include +
+  `LoadedAlgo` 每个变体的 set_skip 编译期 match 全覆盖 +
+  cli.rs 启动 runtime 写 map 失败 bail。新算法忘 include →
+  rustc 编译报错,绝不可能悄悄漏。
 - **2.5-D7 fix1**: 修复客户端命令在 systemd 启动场景找不到 socket 的问题。
   systemd 启动的 daemon 把 socket 绑到 `/run/accel/accel.sock`,但用户从
   shell 跑 `./accel status` 时没继承 INVOCATION_ID 环境变量,旧版本会
@@ -346,8 +354,8 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `89916f78b5f98d38ccf39455251d8e76`
-- **accel 大小**: 1,301,216 字节
+- **accel MD5**: `c21188f1f6a3d0cc8abadfd58c1c1391`
+- **accel 大小**: 1,305,728 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
-- **新增**: preflight 启动检查 + LOSSY BDP+pacing 升级 + 客户端 socket 自动探测
+- **新增**: preflight 启动检查 + LOSSY BDP+pacing 升级 + 客户端 socket 自动探测 + 内网连接绕过 (skip_local)
