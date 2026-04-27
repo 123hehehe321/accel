@@ -643,7 +643,34 @@ connections:
   smart state:       GOOD 40 (88%) | LOSSY 4 (8%) | CONGEST 1 (2%)
 ```
 
-### 9.5.6 验收(D1-D7)
+### 9.5.6 内网/回环连接绕过(skip_local,2.5 后修)
+
+`acc.conf` 顶层加 `skip_local` 字段(默认 `true`),控制以下范围的 TCP
+连接是否被加速算法限速:
+
+- IPv4: 127.0.0.0/8 (回环), 10.0.0.0/8, 172.16.0.0/12,
+  192.168.0.0/16 (RFC1918 私网), 169.254.0.0/16 (链路本地)
+- IPv6: ::1, fe80::/10 (链路本地), fc00::/7 (ULA 私网)
+
+**为什么必要**:
+- 回环和局域网本来就比跨境链路快得多,brutal 按 rate_mbps 限速反而降速
+- smart 在局域网上 min_rtt ≈ 50µs,任何 RTO 触发会让 srtt 飙到 100ms,
+  比例 2000×,直接被分类成 CONGEST,本应是 LOSSY/GOOD 的连接被错误降速
+
+**实现机制**(三层保护,新算法不会遗漏):
+1. **公共头** `ebpf/algorithms/accel_common.h` 声明 `accel_skip_config`
+   BPF map + `should_skip()` 内联函数
+2. **每个算法 `_init`** 调 `should_skip(sk)` 检测内网,若是设 priv->skip=1
+   直接 return,**也不计入 socket_count**(状态计数只反映被实际加速的
+   WAN 连接)
+3. **每个算法 `_main` / `_release`** 检查 priv->skip,跳过所有逻辑
+4. **rustc 编译期保护**: 每个 `LoadedXxx::set_skip()` 引用算法自己的
+   `accel_skip_config` map,新算法忘了 `#include "accel_common.h"` →
+   skel 没这个 map 字段 → set_skip 编译错 → accel 根本无法构建
+5. **runtime 保护**: cli.rs 启动时 match 所有 LoadedAlgo 变体调
+   set_skip,失败立即 bail
+
+### 9.5.7 验收(D1-D7)
 
 - [x] D1: BPF C 编译通过(verifier 友好模式复用 brutal 教训)
 - [x] D2: kernel verifier 接受 struct_ops(VPS 6.12)

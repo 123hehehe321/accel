@@ -58,7 +58,21 @@ use accel_smart_skel::{AccelSmartSkel, AccelSmartSkelBuilder};
 /// to avoid duplication.
 pub struct LoadedCubic {
     _link: Link,
-    _skel: AccelCubicSkel<'static>,
+    skel: AccelCubicSkel<'static>,
+}
+
+impl LoadedCubic {
+    /// Write the skip-local flag into the algorithm's `accel_skip_config`
+    /// BPF map. Cubic doesn't actually rate-limit so this has no
+    /// behavioural effect, but the method must exist (and the map must
+    /// be present in the skeleton) — `cli::run_server` calls
+    /// `set_skip()` on every variant of `LoadedAlgo`, exhaustively. A
+    /// future algorithm that forgets `#include "accel_common.h"` won't
+    /// have the map, won't compile here, and accel won't ship. See
+    /// `ebpf/algorithms/accel_common.h` for the full rationale.
+    pub fn set_skip(&mut self, enabled: bool) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_config, enabled, "accel_cubic")
+    }
 }
 
 /// Per-algorithm Skel + Link bundle for accel_brutal. We keep `skel`
@@ -86,6 +100,12 @@ impl LoadedBrutal {
             .with_context(|| {
                 format!("writing rate {rate_bytes_per_sec} byte/s to brutal_rate_config")
             })
+    }
+
+    /// Write the skip-local flag into the algorithm's `accel_skip_config`
+    /// BPF map. See `LoadedCubic::set_skip` doc.
+    pub fn set_skip(&mut self, enabled: bool) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_config, enabled, "accel_brutal")
     }
 
     /// Read the current count of accel_brutal-managed sockets from the
@@ -169,6 +189,12 @@ impl Drop for LoadedSmart {
 unsafe impl Send for LoadedSmart {}
 
 impl LoadedSmart {
+    /// Write the skip-local flag into the algorithm's `accel_skip_config`
+    /// BPF map. See `LoadedCubic::set_skip` doc.
+    pub fn set_skip(&mut self, enabled: bool) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_config, enabled, "accel_smart")
+    }
+
     /// Write the user-configured GOOD-state target rate (byte/s) and
     /// classification thresholds into `smart_config_map`. The BPF
     /// cong_control re-reads this on every ACK, so updates take
@@ -383,7 +409,7 @@ fn load_cubic() -> Result<LoadedAlgo> {
         .context("registering accel_cubic struct_ops failed (check `dmesg | tail`)")?;
     Ok(LoadedAlgo::Cubic(LoadedCubic {
         _link: link,
-        _skel: skel,
+        skel,
     }))
 }
 
@@ -473,6 +499,32 @@ fn load_smart() -> Result<LoadedAlgo> {
         dup_skel,
         skel,
     }))
+}
+
+/// Write the skip-local flag into one algorithm's `accel_skip_config`
+/// map. Called by every `LoadedXxx::set_skip()`.
+///
+/// The wire layout matches `struct accel_skip_cfg` in
+/// `ebpf/algorithms/accel_common.h`:
+///     __u32 enabled;     // bytes 0..4 (1 = skip, 0 = don't)
+///
+/// The map type is plumbed as a generic `MapMut` so this helper works
+/// for any algorithm's skeleton — calling it on a skel that doesn't
+/// declare `accel_skip_config` is a Rust *compile* error (the
+/// `skel.maps.accel_skip_config` field simply won't exist), which is
+/// the strongest form of "force every algorithm to include
+/// accel_common.h" we can get.
+fn write_skip_config(
+    map: &mut libbpf_rs::MapMut<'_>,
+    enabled: bool,
+    algo_name: &str,
+) -> Result<()> {
+    let key: u32 = 0;
+    let value: u32 = u32::from(enabled);
+    map.update(&key.to_ne_bytes(), &value.to_ne_bytes(), MapFlags::ANY)
+        .with_context(|| {
+            format!("writing accel_skip_config (enabled={enabled}) for {algo_name}")
+        })
 }
 
 /// Build-time probe printed during startup banner — confirms both

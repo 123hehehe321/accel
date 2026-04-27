@@ -13,6 +13,16 @@ pub struct Config {
     /// `[algorithm].default` nested form.
     pub algorithm: String,
 
+    /// Skip rate-limiting / classification on local + intranet TCP
+    /// connections (loopback, RFC1918, IPv6 ULA, link-local). Default
+    /// `true` — these paths are nearly always faster than what brutal /
+    /// smart are tuned for, and smart's classifier additionally
+    /// misreads near-zero min_rtt as CONGEST. Written once at startup
+    /// into every algorithm's `accel_skip_config` BPF map; each
+    /// algorithm's `_init` consults it to set a per-socket skip flag.
+    #[serde(default = "default_skip_local")]
+    pub skip_local: bool,
+
     /// Required only when `algorithm = "accel_brutal"`. Validated at
     /// startup in `cli::run_server`.
     pub brutal: Option<BrutalConfig>,
@@ -22,6 +32,10 @@ pub struct Config {
     pub smart: Option<SmartConfig>,
 
     pub runtime: Runtime,
+}
+
+fn default_skip_local() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

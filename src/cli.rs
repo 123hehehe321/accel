@@ -145,9 +145,30 @@ fn run_server() -> Result<()> {
              struct_ops.link requires Linux 6.4+ with CONFIG_DEBUG_INFO_BTF=y."
         );
     }
-    let mut names: Vec<&str> = loaded_algos.keys().map(String::as_str).collect();
+    let mut names: Vec<String> = loaded_algos.keys().cloned().collect();
     names.sort();
     println!("  loaded: {}", names.join(", "));
+
+    // Push the skip-local flag into every algorithm's accel_skip_config
+    // map. Match exhaustiveness here is the *compile-time* guarantee
+    // that a future LoadedAlgo variant has implemented set_skip — which
+    // in turn forces its BPF .c to `#include "accel_common.h"` (no map
+    // declaration ⇒ no compilable set_skip ⇒ no compiling accel). See
+    // ebpf/algorithms/accel_common.h header comment for full rationale.
+    for (name, algo) in loaded_algos.iter_mut() {
+        let result = match algo {
+            LoadedAlgo::Cubic(c) => c.set_skip(cfg.skip_local),
+            LoadedAlgo::Brutal(b) => b.set_skip(cfg.skip_local),
+            LoadedAlgo::Smart(s) => s.set_skip(cfg.skip_local),
+        };
+        if let Err(e) = result {
+            bail!("set_skip({name}) failed: {e:#}");
+        }
+    }
+    println!(
+        "  skip_local:        {} (loopback / RFC1918 / IPv6 ULA bypass rate-limit)",
+        if cfg.skip_local { "yes" } else { "no" }
+    );
 
     // The user-chosen algorithm must be among the loaded set.
     let target_name = cfg.algorithm.clone();

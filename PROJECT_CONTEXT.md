@@ -183,7 +183,22 @@ cwnd 从初始低位爬升需要几分钟。期间吞吐暴跌(8 Gbps → 49 Mbp
 - LOSSY:`cwnd = BDP`(可升可降,跟随带宽);pacing = 100% bw
 - CONGEST:`cwnd = min(cwnd, BDP)`(只降不升,主动让路);pacing = 50% drain → 90% cruise
 
-### 5.13 preflight 检查只覆盖硬故障,不做完整 doctor
+### 5.13 编译期 + 运行期双重保护强制新算法做对的事
+
+2.5-D7 后修 bug 时引入的范式: 给所有算法一个公共头文件
+`ebpf/algorithms/accel_common.h`,声明一个公共 BPF map (`accel_skip_config`)
++ 内联函数 (`should_skip()`)。每个 BPF .c 文件 `#include` 它,每个
+`LoadedXxx` 实现 `set_skip()` 方法,`cli.rs` 启动时 match 所有变体调一遍。
+
+新算法忘了 include `accel_common.h`:
+- 它的 skel.maps 没有 `accel_skip_config` 字段
+- `LoadedXxx::set_skip()` 引用这个字段 → **rustc 编译报错**(根本不到运行)
+- 即使 unsafe 绕过编译,运行期 cli.rs 调用 set_skip 失败 → bail → accel 不启动
+
+把"忘记"从"silent loss of protection"变成"accel 直接无法启动"。
+**适用范式**: 任何"所有算法都必须做的事"(类似公共安全策略)。
+
+### 5.14 preflight 检查只覆盖硬故障,不做完整 doctor
 
 环境检查机制设计权衡过(2.5-D7 阶段):全功能 `./accel doctor` 子命令是过度设计 ——
 低发现率(用户记不住有这个命令)+ 维护成本(独立检查路径要和实际启动同步)+
@@ -233,7 +248,9 @@ accel 收 SIGHUP 死掉(2.3 未处理 systemd 集成)。建议 `nohup ./accel &`
 | D5 | cli/status/health wire-up + SmartSavedCfg | `74831d5` |
 | D6 | netns + veth + netem 集成测试 (PARTIAL: LOSSY 在 veth 测不出) | binaries `1fffd4d` |
 | LOSSY 升级 | reno → BDP+pacing(D6 暴露的问题) | `ed36e3e` |
-| D7 | preflight + acc.conf.example + 文档 + 部署脚本 | (本次 commit) |
+| D7 | preflight + acc.conf.example + 文档 + 部署脚本 | `0aec35f` |
+| socket fix | client 自动探测 /run/accel/accel.sock | `efb8ba8` |
+| skip_local | 内网/回环连接绕过限速 (accel_common.h 范式) | (本次 commit) |
 
 ### 2.5 smart 算法核心思路
 

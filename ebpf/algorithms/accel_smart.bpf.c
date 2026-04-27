@@ -26,6 +26,11 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+/* Forced-include: pulls in accel_skip_config map + should_skip() so we
+ * can opt local/intranet sockets out of smart's classification +
+ * rate / pacing logic. See accel_common.h for full rationale. */
+#include "accel_common.h"
+
 /* ─── Constants ───────────────────────────────────────────────────────── */
 
 /* Re-stated #defines (not in BTF dump). */
@@ -70,8 +75,9 @@ struct smart_priv {
 	__u32 loss_ewma_bp;   /* loss rate EWMA, basis points (1bp = 0.01%) */
 	__u32 state;          /* LINK_GOOD / LINK_LOSSY / LINK_CONGEST */
 	__u32 last_change;    /* tcp_jiffies32 of last state transition */
+	__u8  skip;           /* 1 if this socket is local/intranet */
 };
-/* 80 + 4 + 4 + 4 = 92 bytes ≤ 104 (ICSK_CA_PRIV_SIZE). */
+/* 80 + 4 + 4 + 4 + 1 → padded to 96 bytes ≤ 104 (ICSK_CA_PRIV_SIZE). */
 _Static_assert(sizeof(struct smart_priv) <= ICSK_CA_PRIV_SIZE,
 	       "smart_priv too large for icsk_ca_priv");
 
@@ -403,6 +409,18 @@ void BPF_PROG(smart_init, struct sock *sk)
 	p->state = LINK_GOOD;
 	p->last_change = tcp_jiffies32;
 
+	/* Local/intranet bypass. Smart's classifier additionally misreads
+	 * near-zero min_rtt as CONGEST (RTO triggers srtt spike, ratio
+	 * blows up — see PROJECT_CONTEXT §5.11), so skipping is the right
+	 * thing to do regardless of whether you also want rate-limit-skip.
+	 * Don't bump socket_count or state_count — the status counters
+	 * should reflect only WAN sockets that the algorithm is actually
+	 * shaping. _main and _release both check p->skip and short-circuit. */
+	if (should_skip(sk)) {
+		p->skip = 1;
+		return;
+	}
+
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
 	/* Pacing: as in accel_brutal Plan B — do NOT write sk_pacing_status
@@ -424,8 +442,11 @@ SEC("struct_ops")
 void BPF_PROG(smart_release, struct sock *sk)
 {
 	struct smart_priv *p = inet_csk_ca(sk);
-	__u32 zero = 0;
+	/* Skipped sockets never bumped any counter — symmetric no-op here. */
+	if (p->skip)
+		return;
 
+	__u32 zero = 0;
 	__u64 *cnt = bpf_map_lookup_elem(&smart_socket_count, &zero);
 	if (cnt && *cnt > 0)
 		__sync_fetch_and_sub(cnt, 1);
@@ -444,6 +465,10 @@ __u32 BPF_PROG(smart_main, struct sock *sk, __u32 ack, int flag,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct smart_priv *p = inet_csk_ca(sk);
+
+	/* Local/intranet bypass — leave cwnd / pacing untouched. */
+	if (p->skip)
+		return 0;
 
 	if (rs->delivered < 0 || rs->interval_us <= 0)
 		return 0;

@@ -22,6 +22,11 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+/* Forced-include: pulls in accel_skip_config map + should_skip() so we
+ * can opt local/intranet sockets out of brutal's rate clamp. See
+ * accel_common.h for full rationale. */
+#include "accel_common.h"
+
 /* ─── Constants ───────────────────────────────────────────────────────── */
 
 /* TCP_INFINITE_SSTHRESH and ICSK_CA_PRIV_SIZE are #defines in <net/tcp.h>;
@@ -62,10 +67,11 @@ struct brutal_pkt_info {
 
 struct brutal_priv {
 	struct brutal_pkt_info slots[PKT_INFO_SLOTS];
+	__u8 skip;   /* 1 if this socket is local/intranet (skip rate limiting) */
 };
 
 /* Compile-time guard against future kernel shrinking icsk_ca_priv or our
- * struct growing. 80 bytes used; 104 available. */
+ * struct growing. 80 + 1 padded to 88 bytes; 104 available. */
 _Static_assert(sizeof(struct brutal_priv) <= ICSK_CA_PRIV_SIZE,
 	       "brutal_priv too large for icsk_ca_priv");
 
@@ -189,6 +195,17 @@ void BPF_PROG(brutal_init, struct sock *sk)
 	 * later step in init noops. */
 	__builtin_memset(b, 0, sizeof(*b));
 
+	/* (1.5) Local/intranet bypass. If skip_local is on in acc.conf and
+	 * either endpoint is loopback / RFC1918 / IPv6 ULA, set the priv
+	 * skip flag and return early. _main and _release both check the
+	 * flag and short-circuit. Critically we also skip the
+	 * brutal_socket_count bump, so the status counter only reflects
+	 * sockets that are actually being rate-limited. */
+	if (should_skip(sk)) {
+		b->skip = 1;
+		return;
+	}
+
 	/* (2) No slow-start: brutal trusts the configured rate. */
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
@@ -231,6 +248,11 @@ void BPF_PROG(brutal_init, struct sock *sk)
 SEC("struct_ops")
 void BPF_PROG(brutal_release, struct sock *sk)
 {
+	struct brutal_priv *b = inet_csk_ca(sk);
+	/* Skipped sockets never bumped the counter — symmetric no-op here. */
+	if (b->skip)
+		return;
+
 	__u32 zero = 0;
 	__u64 *cnt = bpf_map_lookup_elem(&brutal_socket_count, &zero);
 	/* Underflow guard: a non-atomic check + sub may race in extreme
@@ -250,6 +272,11 @@ __u32 BPF_PROG(brutal_main, struct sock *sk, __u32 ack, int flag,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct brutal_priv *b = inet_csk_ca(sk);
+
+	/* Local/intranet bypass — leave cwnd / pacing alone, kernel default
+	 * (whatever the previous CC produced) handles it. */
+	if (b->skip)
+		return 0;
 
 	/* Drop invalid samples (warming up, retransmits without delivery). */
 	if (rs->delivered < 0 || rs->interval_us <= 0)

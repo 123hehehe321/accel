@@ -16,6 +16,15 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+/* Forced-include: every accel algorithm pulls accel_common.h to get the
+ * `accel_skip_config` map declaration. Cubic doesn't rate-limit (it's a
+ * straight CUBIC port), so it doesn't actually call should_skip(), but
+ * the map must still appear in cubic's skeleton so the Rust loader's
+ * uniform set_skip() path compiles and the load-time map check passes
+ * for every algorithm. See accel_common.h header comment for the full
+ * "force include" rationale. */
+#include "accel_common.h"
+
 /* Helpers inlined from tools/testing/selftests/bpf/progs/bpf_tracing_net.h
  * (selftests-private header, not available outside the kernel tree).
  * Only the subset actually used by this file is inlined.
