@@ -118,7 +118,9 @@ fn run_server() -> Result<()> {
         last_shutdown: last_shutdown.clone(),
     })
     .context("writing startup incident")?;
-    println!("incident log: {}", incidents::path().unwrap().display());
+    if let Some(log_path) = incidents::path() {
+        println!("incident log: {}", log_path.display());
+    }
     println!("  kernel:        {kernel}");
     println!("  last shutdown: {last_shutdown}");
 
@@ -272,9 +274,9 @@ fn run_server() -> Result<()> {
         let ifindex = read_ifindex(&smart_cfg.interface)?;
         let (port_min, port_max) = parse_port_range(&smart_cfg.duplicate_ports)?;
         let rate_bytes = smart_cfg.rate_mbps as u64 * 1_000_000 / 8;
-        if !(1..=8).contains(&smart_cfg.duplicate_factor) {
+        if !(1..=100).contains(&smart_cfg.duplicate_factor) {
             bail!(
-                "acc.conf: [smart].duplicate_factor must be in 1..=8 (got {})",
+                "acc.conf: [smart].duplicate_factor must be in 1..=100 (got {})",
                 smart_cfg.duplicate_factor
             );
         }
@@ -399,9 +401,8 @@ fn run_server() -> Result<()> {
 
     health::spawn(Arc::clone(&state)).context("spawning health thread")?;
 
-    let signal_tx = shutdown_tx.clone();
     ctrlc::set_handler(move || {
-        let _ = signal_tx.send(());
+        let _ = shutdown_tx.send(());
     })
     .context("installing SIGINT/SIGTERM handler")?;
 

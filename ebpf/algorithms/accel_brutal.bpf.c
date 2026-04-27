@@ -53,9 +53,9 @@
 #define MIN_PKT_INFO_SAMPLES    50
 #define MIN_ACK_RATE_PERCENT    80  /* clamp floor — soul of brutal */
 
-/* min/max helpers (kernel #defines we don't pull in). */
+/* min helper (kernel #define we don't pull in). brutal doesn't use
+ * max_t. */
 #define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
-#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
 
 /* ─── Per-socket private state (lives in icsk_ca_priv) ────────────────── */
 

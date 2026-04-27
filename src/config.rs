@@ -73,8 +73,8 @@ pub struct SmartConfig {
 
     /// LOSSY-state packet multiplier — total copies per outbound TCP
     /// packet (1 = original only / no clone, 2 = original + 1 clone,
-    /// up to 8). Hard upper bound 8 because higher factors saturate
-    /// the link and trigger real congestion. Default 2.
+    /// up to 100). Default 2 covers ~50% loss scenarios; raise for
+    /// extreme links (satellite / heavy mobile / etc).
     #[serde(default = "default_duplicate_factor")]
     pub duplicate_factor: u32,
 

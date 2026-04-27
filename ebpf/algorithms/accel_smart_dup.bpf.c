@@ -48,15 +48,21 @@ struct {
 
 /* Hard upper bound on packet multiplier: each LOSSY-state TCP packet
  * is sent up to MAX_DUP_FACTOR copies in total (1 = no clone, 2 =
- * original + 1 clone, ..., 8 = original + 7 clones). The BPF clone
+ * original + 1 clone, ..., 100 = original + 99 clones). The BPF clone
  * loop is statically unrolled to MAX_DUP_FACTOR iterations so the
  * verifier sees a fixed instruction count regardless of user setting.
  *
- * 8 is chosen as a sane ceiling: more than 8× quickly saturates the
- * underlying link and triggers real congestion. If you legitimately
- * need more, raise this constant — the cost is just a few extra
- * unrolled BPF instructions. */
-#define MAX_DUP_FACTOR 8
+ * 100 is the operational ceiling. Real-world use cases:
+ *   2x  default — covers ~50% packet loss
+ *   3-5 high-loss cross-border / mobile networks
+ *   10+ extreme conditions (lossy satellite, severely degraded paths)
+ *   100 maximum sane bound; beyond this the link is the bottleneck
+ *       regardless of cloning, and verifier insn count starts mattering
+ *
+ * The unrolled loop below produces ~5 BPF insns per iteration → at
+ * MAX_DUP_FACTOR=100 the dup program is ~500 insns, well within the
+ * 1M-insn verifier budget. */
+#define MAX_DUP_FACTOR 100
 
 /* Duplication parameters. Userspace writes once at startup.
  *   ifindex     — egress interface to clone onto (must be the same
