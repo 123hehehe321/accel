@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::{Link, MapCore, MapFlags, OpenObject};
 
@@ -70,8 +70,8 @@ impl LoadedCubic {
     /// future algorithm that forgets `#include "accel_common.h"` won't
     /// have the map, won't compile here, and accel won't ship. See
     /// `ebpf/algorithms/accel_common.h` for the full rationale.
-    pub fn set_skip(&mut self, enabled: bool) -> Result<()> {
-        write_skip_config(&mut self.skel.maps.accel_skip_config, enabled, "accel_cubic")
+    pub fn set_skip(&mut self, rules: &[SkipRule]) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_config, rules, "accel_cubic")
     }
 }
 
@@ -104,8 +104,8 @@ impl LoadedBrutal {
 
     /// Write the skip-local flag into the algorithm's `accel_skip_config`
     /// BPF map. See `LoadedCubic::set_skip` doc.
-    pub fn set_skip(&mut self, enabled: bool) -> Result<()> {
-        write_skip_config(&mut self.skel.maps.accel_skip_config, enabled, "accel_brutal")
+    pub fn set_skip(&mut self, rules: &[SkipRule]) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_config, rules, "accel_brutal")
     }
 
     /// Read the current count of accel_brutal-managed sockets from the
@@ -191,8 +191,8 @@ unsafe impl Send for LoadedSmart {}
 impl LoadedSmart {
     /// Write the skip-local flag into the algorithm's `accel_skip_config`
     /// BPF map. See `LoadedCubic::set_skip` doc.
-    pub fn set_skip(&mut self, enabled: bool) -> Result<()> {
-        write_skip_config(&mut self.skel.maps.accel_skip_config, enabled, "accel_smart")
+    pub fn set_skip(&mut self, rules: &[SkipRule]) -> Result<()> {
+        write_skip_config(&mut self.skel.maps.accel_skip_config, rules, "accel_smart")
     }
 
     /// Write the user-configured GOOD-state target rate (byte/s) and
@@ -501,12 +501,30 @@ fn load_smart() -> Result<LoadedAlgo> {
     }))
 }
 
-/// Write the skip-local flag into one algorithm's `accel_skip_config`
-/// map. Called by every `LoadedXxx::set_skip()`.
-///
-/// The wire layout matches `struct accel_skip_cfg` in
-/// `ebpf/algorithms/accel_common.h`:
-///     __u32 enabled;     // bytes 0..4 (1 = skip, 0 = don't)
+/// One parsed, ready-to-ship skip rule. `family` is `libc::AF_INET` (2)
+/// or `libc::AF_INET6` (10). `addr` and `mask` are 4 host-byte-order
+/// u32 words; for IPv4, only `[0]` carries the address/mask, the
+/// remaining three words are zero.
+#[derive(Clone, Copy, Debug)]
+pub struct SkipRule {
+    pub family: u32,
+    pub addr: [u32; 4],
+    pub mask: [u32; 4],
+}
+
+/// Maximum number of skip rules accepted. Mirrors `MAX_SKIP_RULES` in
+/// `ebpf/algorithms/accel_common.h` — the BPF-side ARRAY map reserves
+/// exactly this many slots.
+pub const MAX_SKIP_RULES: usize = 32;
+
+/// Wire size of `struct accel_skip_cfg` in accel_common.h. Layout:
+///     u32 count          // bytes 0..4
+///     u32 _pad           //       4..8
+///     skip_rule[32]      //       8..1288    (40 bytes per rule)
+const SKIP_CFG_BYTES: usize = 8 + MAX_SKIP_RULES * 40;
+
+/// Write a list of skip rules into one algorithm's `accel_skip_config`
+/// BPF map. Called by every `LoadedXxx::set_skip()`.
 ///
 /// The map type is plumbed as a generic `MapMut` so this helper works
 /// for any algorithm's skeleton — calling it on a skel that doesn't
@@ -516,14 +534,49 @@ fn load_smart() -> Result<LoadedAlgo> {
 /// accel_common.h" we can get.
 fn write_skip_config(
     map: &mut libbpf_rs::MapMut<'_>,
-    enabled: bool,
+    rules: &[SkipRule],
     algo_name: &str,
 ) -> Result<()> {
+    if rules.len() > MAX_SKIP_RULES {
+        bail!(
+            "too many skip rules ({}); max is {}",
+            rules.len(),
+            MAX_SKIP_RULES
+        );
+    }
+
+    let mut buf = [0u8; SKIP_CFG_BYTES];
+    // count at byte 0..4
+    let count = rules.len() as u32;
+    buf[0..4].copy_from_slice(&count.to_ne_bytes());
+    // _pad at 4..8 stays zero
+
+    // rules at 8..  — each rule is 40 bytes:
+    //   u32 family   (offset 0..4 of the rule)
+    //   u32 _pad     (4..8)
+    //   u32 addr[4]  (8..24)
+    //   u32 mask[4]  (24..40)
+    for (i, rule) in rules.iter().enumerate() {
+        let base = 8 + i * 40;
+        buf[base..base + 4].copy_from_slice(&rule.family.to_ne_bytes());
+        // pad at base+4..base+8 stays zero
+        for w in 0..4 {
+            let off = base + 8 + w * 4;
+            buf[off..off + 4].copy_from_slice(&rule.addr[w].to_ne_bytes());
+        }
+        for w in 0..4 {
+            let off = base + 24 + w * 4;
+            buf[off..off + 4].copy_from_slice(&rule.mask[w].to_ne_bytes());
+        }
+    }
+
     let key: u32 = 0;
-    let value: u32 = u32::from(enabled);
-    map.update(&key.to_ne_bytes(), &value.to_ne_bytes(), MapFlags::ANY)
+    map.update(&key.to_ne_bytes(), &buf, MapFlags::ANY)
         .with_context(|| {
-            format!("writing accel_skip_config (enabled={enabled}) for {algo_name}")
+            format!(
+                "writing accel_skip_config ({} rules) for {algo_name}",
+                rules.len()
+            )
         })
 }
 

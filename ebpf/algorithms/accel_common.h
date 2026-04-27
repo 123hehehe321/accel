@@ -4,27 +4,33 @@
  *
  * Two responsibilities:
  *
- *   1. Declare the per-algorithm `accel_skip_config` BPF map (1 entry,
- *      written once by Rust at startup, read by `should_skip()` on every
- *      socket _init).
+ *   1. Declare the per-algorithm `accel_skip_config` BPF map. Each
+ *      algorithm gets its own copy (single-entry ARRAY, ~1.3 KB);
+ *      Rust writes the same content to all of them at startup.
  *
- *   2. Provide `is_local_connection()` and `should_skip()` static inlines
- *      so each algorithm's _init can decide whether to opt out of rate
- *      limiting / state tracking for loopback and intranet connections.
+ *   2. Provide `should_skip(sk)` that every algorithm's _init calls
+ *      to decide whether this socket should bypass the algorithm
+ *      (rate limiting, classification, pacing). Skipped sockets get
+ *      kernel-default cong_control behaviour.
  *
- * Forced inclusion: every algorithm MUST `#include "accel_common.h"`.
- * The Rust loader treats a missing `accel_skip_config` map on any
- * algorithm's skeleton as a hard failure (see `ebpf_loader.rs::load_*`)
- * — accel won't start. This makes "I forgot the include" a compile-time
- * (skel field absent → set_skip won't compile) AND runtime-time
- * (load-time bail) error, not a silent loss of protection.
+ * SCOPE OF MATCHING
+ *   * Both sk_daddr AND sk_rcv_saddr are checked against every rule.
+ *     If EITHER matches, the connection is skipped. This catches
+ *     client-side outbound (daddr is local), server accept sockets
+ *     bound to 127.0.0.1 (saddr is local), and intra-host tunnels.
+ *   * Both AF_INET and AF_INET6 supported. Rules carry the family
+ *     and only match same-family sockets.
+ *   * Masks are precomputed in Rust (one network-byte-order address
+ *     and one bit-mask per word, both in host byte order on the wire),
+ *     so the BPF program does only AND + equality compares — verifier
+ *     friendly, no in-BPF conditional shifts.
  *
- * Why per-algorithm maps (not one shared via reuse_fd)?
- *   The shared-map pattern (cf. `smart_link_state` between smart and
- *   smart_dup) is overkill here — we only need one writer (Rust at
- *   startup) writing 4 bytes per algorithm. Three independent
- *   single-entry ARRAY maps cost 3×24 bytes total and avoid load-order
- *   coupling.
+ * FORCED INCLUSION
+ *   Every algorithm MUST `#include "accel_common.h"`. The Rust loader
+ *   relies on each algo's skel exposing `accel_skip_config` (compile-
+ *   time check via `LoadedXxx::set_skip`), and additionally `cli.rs`
+ *   exhaustively matches every `LoadedAlgo` variant. A new algorithm
+ *   that forgets the include cannot compile, let alone ship.
  */
 
 #ifndef ACCEL_COMMON_H
@@ -34,10 +40,34 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-/* ─── Skip-local config ──────────────────────────────────────────────── */
+/* ─── AF constants (not in BTF dump) ─────────────────────────────────── */
+
+#ifndef AF_INET
+#define AF_INET   2
+#endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
+/* ─── Skip-rule wire layout ──────────────────────────────────────────── */
+
+#define MAX_SKIP_RULES 32
+
+/* 40 bytes per rule. Layout matches the Rust serializer in
+ * `ebpf_loader::write_skip_config()` — DO NOT REORDER without updating
+ * both sides. Native byte order (kernel reads in host endianness;
+ * we never serialize across machines). */
+struct skip_rule {
+	__u32 family;     /* AF_INET (2) or AF_INET6 (10) */
+	__u32 _pad;
+	__u32 addr[4];    /* host-byte-order; v4 only uses addr[0] */
+	__u32 mask[4];    /* precomputed from CIDR prefix in Rust */
+};
 
 struct accel_skip_cfg {
-	__u32 enabled;   /* 1 = skip local connections, 0 = treat them like any other */
+	__u32 count;                              /* number of valid rules in [] */
+	__u32 _pad;
+	struct skip_rule rules[MAX_SKIP_RULES];   /* 32 × 40 = 1280 bytes */
 };
 
 struct {
@@ -47,108 +77,88 @@ struct {
 	__type(value, struct accel_skip_cfg);
 } accel_skip_config SEC(".maps");
 
-/* ─── Address-family + AF constants (not in BTF dump) ────────────────── */
+/* ─── Match logic ────────────────────────────────────────────────────── */
 
-#ifndef AF_INET
-#define AF_INET   2
-#endif
-#ifndef AF_INET6
-#define AF_INET6 10
-#endif
-
-/* ─── IP-range checks ────────────────────────────────────────────────── */
-
-/* Returns 1 if `addr_be` (network byte order, as stored in struct sock)
- * falls inside one of the four "definitely not WAN" IPv4 ranges:
- *   127.0.0.0/8     loopback
- *   10.0.0.0/8      RFC1918 class A
- *   172.16.0.0/12   RFC1918 class B
- *   192.168.0.0/16  RFC1918 class C
- *   169.254.0.0/16  link-local (APIPA)
- *
- * Reasoning for "skip these in rate-limiting algorithms":
- * loopback is already at memory speed and gets nothing from pacing;
- * RFC1918 traffic is nearly always intra-data-center / intra-LAN where
- * the path is much faster and lower-latency than what the algorithm is
- * tuned for, and smart's classifier additionally misreads near-zero
- * min_rtt as CONGEST.
- */
-static __always_inline int is_local_v4(__be32 addr_be)
+/* Returns 1 iff `addr_h` (host byte order) falls inside the rule's
+ * IPv4 subnet. The rule is assumed to have family == AF_INET. */
+static __always_inline int match_v4_addr(__u32 addr_h, const struct skip_rule *r)
 {
-	__u32 a = bpf_ntohl(addr_be);
-
-	if ((a & 0xff000000) == 0x7f000000) return 1;  /* 127.0.0.0/8   */
-	if ((a & 0xff000000) == 0x0a000000) return 1;  /* 10.0.0.0/8    */
-	if ((a & 0xfff00000) == 0xac100000) return 1;  /* 172.16.0.0/12 */
-	if ((a & 0xffff0000) == 0xc0a80000) return 1;  /* 192.168.0.0/16 */
-	if ((a & 0xffff0000) == 0xa9fe0000) return 1;  /* 169.254.0.0/16 */
-	return 0;
+	return (addr_h & r->mask[0]) == (r->addr[0] & r->mask[0]);
 }
 
-/* Returns 1 if the IPv6 address (4× __be32 words) falls inside:
- *   ::1/128       loopback
- *   fe80::/10     link-local
- *   fc00::/7      ULA (RFC4193 unique local addresses)
- *
- * IPv6 "carrier-grade NAT"-style transition prefixes (e.g. 64:ff9b::/96)
- * are NOT skipped — they're routed via the ISP and benefit from accel.
- */
-static __always_inline int is_local_v6(const __be32 addr32[4])
+/* Returns 1 iff the IPv6 address (4× host-byte-order words) falls
+ * inside the rule's subnet. The rule is assumed to have family ==
+ * AF_INET6. */
+static __always_inline int match_v6_addr(const __u32 addr_h[4],
+					 const struct skip_rule *r)
 {
-	__u32 w0 = bpf_ntohl(addr32[0]);
-	__u32 w1 = bpf_ntohl(addr32[1]);
-	__u32 w2 = bpf_ntohl(addr32[2]);
-	__u32 w3 = bpf_ntohl(addr32[3]);
-
-	/* ::1 */
-	if (w0 == 0 && w1 == 0 && w2 == 0 && w3 == 1) return 1;
-	/* fe80::/10 — first 10 bits = 1111111010 = 0xfe80..0xfebf high16 */
-	if ((w0 & 0xffc00000) == 0xfe800000) return 1;
-	/* fc00::/7 — first 7 bits = 1111110, covers fc00::/8 and fd00::/8 */
-	if ((w0 & 0xfe000000) == 0xfc000000) return 1;
-	return 0;
+	return (addr_h[0] & r->mask[0]) == (r->addr[0] & r->mask[0])
+	    && (addr_h[1] & r->mask[1]) == (r->addr[1] & r->mask[1])
+	    && (addr_h[2] & r->mask[2]) == (r->addr[2] & r->mask[2])
+	    && (addr_h[3] & r->mask[3]) == (r->addr[3] & r->mask[3]);
 }
 
-/* Returns 1 if EITHER endpoint of the connection is local.
- * Both src and dst are checked because a server bound to 127.0.0.1
- * accepting a client from a public IP, or vice versa, should still
- * skip — there's at least one local hop.
- */
-static __always_inline int is_local_connection(struct sock *sk)
+/* Check both daddr and saddr of `sk` against `r`. Returns 1 on hit. */
+static __always_inline int rule_hits_socket(struct sock *sk,
+					    const struct skip_rule *r)
 {
 	__u16 family = sk->__sk_common.skc_family;
+	if ((__u32)family != r->family)
+		return 0;
 
 	if (family == AF_INET) {
-		__be32 daddr = sk->__sk_common.skc_daddr;
-		__be32 saddr = sk->__sk_common.skc_rcv_saddr;
-		return is_local_v4(daddr) || is_local_v4(saddr);
+		__u32 d = bpf_ntohl(sk->__sk_common.skc_daddr);
+		__u32 s = bpf_ntohl(sk->__sk_common.skc_rcv_saddr);
+		return match_v4_addr(d, r) || match_v4_addr(s, r);
 	}
 
 	if (family == AF_INET6) {
-		const __be32 *daddr =
+		const __be32 *d_be =
 			sk->__sk_common.skc_v6_daddr.in6_u.u6_addr32;
-		const __be32 *saddr =
+		const __be32 *s_be =
 			sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32;
-		return is_local_v6(daddr) || is_local_v6(saddr);
+		__u32 d_h[4] = {
+			bpf_ntohl(d_be[0]), bpf_ntohl(d_be[1]),
+			bpf_ntohl(d_be[2]), bpf_ntohl(d_be[3]),
+		};
+		__u32 s_h[4] = {
+			bpf_ntohl(s_be[0]), bpf_ntohl(s_be[1]),
+			bpf_ntohl(s_be[2]), bpf_ntohl(s_be[3]),
+		};
+		return match_v6_addr(d_h, r) || match_v6_addr(s_h, r);
 	}
 
-	/* Other families (AF_UNIX etc.) shouldn't even be running TCP
-	 * congestion control, but be defensive: treat as non-local. */
 	return 0;
 }
 
 /* The single entry-point each algorithm calls from its _init callback.
- * Returns 1 → caller should set its priv->skip flag and skip all per-ACK
- * work; returns 0 → algorithm proceeds normally.
+ * Returns 1 → caller should set its priv->skip flag and short-circuit
+ * all per-ACK work. Returns 0 → algorithm proceeds normally.
+ *
+ * Iteration is statically unrolled with constant indices because v6.12
+ * verifier rejects variable offsets on PTR_TO_MAP_VALUE. The `i >= count`
+ * break gives early termination once all real rules have been checked.
  */
 static __always_inline int should_skip(struct sock *sk)
 {
 	__u32 zero = 0;
 	struct accel_skip_cfg *cfg =
 		bpf_map_lookup_elem(&accel_skip_config, &zero);
-	if (!cfg || !cfg->enabled)
+	if (!cfg)
 		return 0;
-	return is_local_connection(sk);
+
+	__u32 count = cfg->count;
+	if (count > MAX_SKIP_RULES)
+		count = MAX_SKIP_RULES; /* defensive bound for verifier */
+
+	#pragma unroll
+	for (int i = 0; i < MAX_SKIP_RULES; i++) {
+		if ((__u32)i >= count)
+			break;
+		if (rule_hits_socket(sk, &cfg->rules[i]))
+			return 1;
+	}
+	return 0;
 }
 
 #endif /* ACCEL_COMMON_H */

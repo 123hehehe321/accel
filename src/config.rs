@@ -13,15 +13,24 @@ pub struct Config {
     /// `[algorithm].default` nested form.
     pub algorithm: String,
 
-    /// Skip rate-limiting / classification on local + intranet TCP
-    /// connections (loopback, RFC1918, IPv6 ULA, link-local). Default
-    /// `true` — these paths are nearly always faster than what brutal /
-    /// smart are tuned for, and smart's classifier additionally
-    /// misreads near-zero min_rtt as CONGEST. Written once at startup
-    /// into every algorithm's `accel_skip_config` BPF map; each
-    /// algorithm's `_init` consults it to set a per-socket skip flag.
-    #[serde(default = "default_skip_local")]
-    pub skip_local: bool,
+    /// Comma-separated list of CIDR subnets to skip (rate-limit and
+    /// classification bypass). Both IPv4 and IPv6 are supported. Each
+    /// entry is matched against the connection's destination AND source
+    /// addresses — either side hitting any rule causes the socket to
+    /// bypass the algorithm. Required field (production safety: no
+    /// silent default behaviour).
+    ///
+    /// Examples (all canonical — host bits beyond the prefix MUST be
+    /// zero, otherwise startup bails):
+    ///     "127.0.0.0/8"
+    ///     "10.0.0.0/8,192.168.0.0/16"
+    ///     "::1/128,fe80::/10,fc00::/7"
+    ///     ""                     (empty: no rules; everything goes through accel)
+    ///
+    /// Hard cap: 32 rules total (BPF map sized for that). Parser bails
+    /// past 32. acc.conf.example ships an 8-rule default covering RFC1918
+    /// + loopback + link-local + IPv6 ULA.
+    pub skip_subnet: Option<String>,
 
     /// Required only when `algorithm = "accel_brutal"`. Validated at
     /// startup in `cli::run_server`.
@@ -32,10 +41,6 @@ pub struct Config {
     pub smart: Option<SmartConfig>,
 
     pub runtime: Runtime,
-}
-
-fn default_skip_local() -> bool {
-    true
 }
 
 #[derive(Debug, Deserialize)]

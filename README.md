@@ -643,23 +643,38 @@ connections:
   smart state:       GOOD 40 (88%) | LOSSY 4 (8%) | CONGEST 1 (2%)
 ```
 
-### 9.5.6 内网/回环连接绕过(skip_local,2.5 后修)
+### 9.5.6 不加速的网段(skip_subnet,2.5 后修)
 
-`acc.conf` 顶层加 `skip_local` 字段(默认 `true`),控制以下范围的 TCP
-连接是否被加速算法限速:
+`acc.conf` 顶层 `skip_subnet` 是必填字段,逗号分隔的 CIDR 列表。匹配
+到的 TCP 连接不被加速算法限速,走 kernel 默认行为。**目的地址**和
+**源地址**都会被检查,任一命中就跳过(覆盖客户端出站、服务端 127.x
+绑定、内网隧道等场景)。
 
-- IPv4: 127.0.0.0/8 (回环), 10.0.0.0/8, 172.16.0.0/12,
-  192.168.0.0/16 (RFC1918 私网), 169.254.0.0/16 (链路本地)
-- IPv6: ::1, fe80::/10 (链路本地), fc00::/7 (ULA 私网)
+**默认推荐配置** (acc.conf.example):
+
+```toml
+skip_subnet = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1/128,fe80::/10,fc00::/7"
+```
+
+涵盖 IPv4 RFC1918 + 链路本地 + IPv6 loopback / link-local / ULA。
+用户可加自定义网段 (Tailscale 100.64.0.0/10、自建 VPN 10.8.0.0/24
+等)。最多 32 条规则。
 
 **为什么必要**:
 - 回环和局域网本来就比跨境链路快得多,brutal 按 rate_mbps 限速反而降速
 - smart 在局域网上 min_rtt ≈ 50µs,任何 RTO 触发会让 srtt 飙到 100ms,
   比例 2000×,直接被分类成 CONGEST,本应是 LOSSY/GOOD 的连接被错误降速
 
-**实现机制**(三层保护,新算法不会遗漏):
+**严格 CIDR 校验** (生产安全):
+- host bits 必须为零。`192.168.1.0/16` 启动失败,提示规范化为
+  `192.168.0.0/16`。
+- prefix 范围:IPv4 0..=32,IPv6 0..=128。
+- 必填:字段不存在 → bail。空字符串 `""` 表示**所有 TCP 都走加速**
+  (含回环,99% 场景不该这样)。
+
+**实现机制**(五层保护,新算法不会遗漏):
 1. **公共头** `ebpf/algorithms/accel_common.h` 声明 `accel_skip_config`
-   BPF map + `should_skip()` 内联函数
+   BPF map (1.3 KB,32 条 × 40 字节规则 + count) + `should_skip()` 内联
 2. **每个算法 `_init`** 调 `should_skip(sk)` 检测内网,若是设 priv->skip=1
    直接 return,**也不计入 socket_count**(状态计数只反映被实际加速的
    WAN 连接)
@@ -668,7 +683,7 @@ connections:
    `accel_skip_config` map,新算法忘了 `#include "accel_common.h"` →
    skel 没这个 map 字段 → set_skip 编译错 → accel 根本无法构建
 5. **runtime 保护**: cli.rs 启动时 match 所有 LoadedAlgo 变体调
-   set_skip,失败立即 bail
+   set_skip,失败立即 bail。CIDR 解析 13 个单元测试覆盖严格性
 
 ### 9.5.7 验收(D1-D7)
 

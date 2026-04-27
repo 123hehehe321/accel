@@ -149,26 +149,54 @@ fn run_server() -> Result<()> {
     names.sort();
     println!("  loaded: {}", names.join(", "));
 
-    // Push the skip-local flag into every algorithm's accel_skip_config
-    // map. Match exhaustiveness here is the *compile-time* guarantee
-    // that a future LoadedAlgo variant has implemented set_skip — which
-    // in turn forces its BPF .c to `#include "accel_common.h"` (no map
+    // Skip-subnet handling. Required field — production safety: no
+    // silent default. Empty string ⇒ zero rules (every connection
+    // accelerated, including loopback). Non-empty ⇒ strict CIDR list,
+    // host bits beyond prefix MUST be zero.
+    let skip_spec = cfg
+        .skip_subnet
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "acc.conf: skip_subnet is required. Set to \"\" if you genuinely \
+                 want every connection accelerated; otherwise list CIDRs to bypass \
+                 (e.g. \"127.0.0.0/8,10.0.0.0/8,192.168.0.0/16,::1/128\"). See \
+                 acc.conf.example for a sensible default."
+            )
+        })?;
+    let skip_rules = parse_skip_subnet(skip_spec)?;
+    if skip_rules.len() > ebpf_loader::MAX_SKIP_RULES {
+        bail!(
+            "acc.conf: skip_subnet has {} rules; max is {}",
+            skip_rules.len(),
+            ebpf_loader::MAX_SKIP_RULES
+        );
+    }
+
+    // Push the rule list into every algorithm's accel_skip_config map.
+    // Match exhaustiveness here is the *compile-time* guarantee that a
+    // future LoadedAlgo variant has implemented set_skip — which in
+    // turn forces its BPF .c to `#include "accel_common.h"` (no map
     // declaration ⇒ no compilable set_skip ⇒ no compiling accel). See
     // ebpf/algorithms/accel_common.h header comment for full rationale.
     for (name, algo) in loaded_algos.iter_mut() {
         let result = match algo {
-            LoadedAlgo::Cubic(c) => c.set_skip(cfg.skip_local),
-            LoadedAlgo::Brutal(b) => b.set_skip(cfg.skip_local),
-            LoadedAlgo::Smart(s) => s.set_skip(cfg.skip_local),
+            LoadedAlgo::Cubic(c) => c.set_skip(&skip_rules),
+            LoadedAlgo::Brutal(b) => b.set_skip(&skip_rules),
+            LoadedAlgo::Smart(s) => s.set_skip(&skip_rules),
         };
         if let Err(e) = result {
             bail!("set_skip({name}) failed: {e:#}");
         }
     }
-    println!(
-        "  skip_local:        {} (loopback / RFC1918 / IPv6 ULA bypass rate-limit)",
-        if cfg.skip_local { "yes" } else { "no" }
-    );
+    if skip_rules.is_empty() {
+        println!("  skip_subnet:       (empty — every connection accelerated)");
+    } else {
+        println!("  skip_subnet:       {} rule(s):", skip_rules.len());
+        for s in skip_spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            println!("                       {s}");
+        }
+    }
 
     // The user-chosen algorithm must be among the loaded set.
     let target_name = cfg.algorithm.clone();
@@ -536,6 +564,115 @@ fn parse_port_range(s: &str) -> Result<(u16, u16)> {
     Ok((lo, hi))
 }
 
+/// Parse the comma-separated CIDR list from `[runtime].skip_subnet`
+/// into ready-to-ship `SkipRule`s. Strict mode: every entry must be
+/// canonical (host bits beyond the prefix MUST be zero) and the
+/// prefix length must be in range for the address family. Empty
+/// input ⇒ zero rules (caller decides what that means).
+fn parse_skip_subnet(spec: &str) -> Result<Vec<ebpf_loader::SkipRule>> {
+    let mut out = Vec::new();
+    for raw in spec.split(',') {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        out.push(parse_one_cidr(entry)?);
+    }
+    Ok(out)
+}
+
+/// Parse and validate a single CIDR entry. Strict semantics:
+///   * exactly one '/' separator
+///   * IP parses as Ipv4Addr or Ipv6Addr
+///   * prefix is in 0..=32 (v4) or 0..=128 (v6)
+///   * (ip & ~mask) == 0 — i.e. all host bits zero
+fn parse_one_cidr(entry: &str) -> Result<ebpf_loader::SkipRule> {
+    let (ip_str, prefix_str) = entry
+        .split_once('/')
+        .ok_or_else(|| anyhow!("CIDR {entry:?} missing '/' (e.g. \"10.0.0.0/8\")"))?;
+    let ip_str = ip_str.trim();
+    let prefix_str = prefix_str.trim();
+
+    if let Ok(ip4) = ip_str.parse::<std::net::Ipv4Addr>() {
+        let prefix: u32 = prefix_str
+            .parse()
+            .with_context(|| format!("CIDR {entry:?}: cannot parse prefix"))?;
+        if prefix > 32 {
+            bail!("CIDR {entry:?}: IPv4 prefix must be 0..=32 (got {prefix})");
+        }
+        let addr_h: u32 = u32::from(ip4);
+        let mask = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix) };
+        if addr_h & !mask != 0 {
+            let canonical = std::net::Ipv4Addr::from(addr_h & mask);
+            bail!(
+                "CIDR {entry:?}: host bits beyond prefix /{prefix} are set. \
+                 Did you mean \"{canonical}/{prefix}\"?"
+            );
+        }
+        Ok(ebpf_loader::SkipRule {
+            family: libc::AF_INET as u32,
+            addr: [addr_h, 0, 0, 0],
+            mask: [mask, 0, 0, 0],
+        })
+    } else if let Ok(ip6) = ip_str.parse::<std::net::Ipv6Addr>() {
+        let prefix: u32 = prefix_str
+            .parse()
+            .with_context(|| format!("CIDR {entry:?}: cannot parse prefix"))?;
+        if prefix > 128 {
+            bail!("CIDR {entry:?}: IPv6 prefix must be 0..=128 (got {prefix})");
+        }
+        // Decompose the 128-bit address into 4 host-byte-order u32 words.
+        let words: [u32; 4] = ip6.segments().chunks(2).map(|pair| {
+            ((pair[0] as u32) << 16) | (pair[1] as u32)
+        }).collect::<Vec<_>>().try_into().expect("4 chunks");
+        // Build per-word mask from the 0..128 prefix.
+        let mut mask = [0u32; 4];
+        let mut remaining = prefix;
+        for slot in mask.iter_mut() {
+            if remaining >= 32 {
+                *slot = !0u32;
+                remaining -= 32;
+            } else if remaining > 0 {
+                *slot = (!0u32) << (32 - remaining);
+                remaining = 0;
+            } else {
+                *slot = 0;
+            }
+        }
+        for (w, &word) in words.iter().enumerate() {
+            if word & !mask[w] != 0 {
+                let canonical_words = [
+                    words[0] & mask[0],
+                    words[1] & mask[1],
+                    words[2] & mask[2],
+                    words[3] & mask[3],
+                ];
+                let canonical = std::net::Ipv6Addr::new(
+                    (canonical_words[0] >> 16) as u16,
+                    (canonical_words[0] & 0xFFFF) as u16,
+                    (canonical_words[1] >> 16) as u16,
+                    (canonical_words[1] & 0xFFFF) as u16,
+                    (canonical_words[2] >> 16) as u16,
+                    (canonical_words[2] & 0xFFFF) as u16,
+                    (canonical_words[3] >> 16) as u16,
+                    (canonical_words[3] & 0xFFFF) as u16,
+                );
+                bail!(
+                    "CIDR {entry:?}: host bits beyond prefix /{prefix} are set. \
+                     Did you mean \"{canonical}/{prefix}\"?"
+                );
+            }
+        }
+        Ok(ebpf_loader::SkipRule {
+            family: libc::AF_INET6 as u32,
+            addr: words,
+            mask,
+        })
+    } else {
+        bail!("CIDR {entry:?}: cannot parse \"{ip_str}\" as IPv4 or IPv6 address")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_port_range;
@@ -558,5 +695,123 @@ mod tests {
         assert!(parse_port_range("100-50").is_err()); // lo > hi
         assert!(parse_port_range("0-100").is_err()); // zero endpoint
         assert!(parse_port_range("abc-100").is_err());
+    }
+
+    use super::{parse_one_cidr, parse_skip_subnet};
+
+    #[test]
+    fn cidr_v4_basic() {
+        let r = parse_one_cidr("127.0.0.0/8").unwrap();
+        assert_eq!(r.family, libc::AF_INET as u32);
+        assert_eq!(r.addr[0], 0x7F00_0000);
+        assert_eq!(r.mask[0], 0xFF00_0000);
+        assert_eq!(r.addr[1..], [0, 0, 0]);
+        assert_eq!(r.mask[1..], [0, 0, 0]);
+    }
+
+    #[test]
+    fn cidr_v4_canonical_192_168() {
+        let r = parse_one_cidr("192.168.0.0/16").unwrap();
+        assert_eq!(r.addr[0], 0xC0A8_0000);
+        assert_eq!(r.mask[0], 0xFFFF_0000);
+    }
+
+    #[test]
+    fn cidr_v4_strict_rejects_host_bits() {
+        // 192.168.1.0/16 has host bits → should be rejected with helpful msg.
+        let err = parse_one_cidr("192.168.1.0/16").unwrap_err().to_string();
+        assert!(err.contains("192.168.0.0/16"), "msg = {err}");
+        // 10.5.5.5/8 likewise.
+        let err = parse_one_cidr("10.5.5.5/8").unwrap_err().to_string();
+        assert!(err.contains("10.0.0.0/8"), "msg = {err}");
+    }
+
+    #[test]
+    fn cidr_v4_prefix_bounds() {
+        assert!(parse_one_cidr("10.0.0.0/33").is_err());
+        // /0 is allowed (matches everything), addr must be 0.0.0.0
+        assert!(parse_one_cidr("0.0.0.0/0").is_ok());
+        assert!(parse_one_cidr("1.2.3.4/0").is_err()); // host bits set under /0
+        // /32 means single host
+        let r = parse_one_cidr("8.8.8.8/32").unwrap();
+        assert_eq!(r.mask[0], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn cidr_v6_loopback() {
+        let r = parse_one_cidr("::1/128").unwrap();
+        assert_eq!(r.family, libc::AF_INET6 as u32);
+        assert_eq!(r.addr, [0, 0, 0, 1]);
+        assert_eq!(r.mask, [0xFFFF_FFFF; 4]);
+    }
+
+    #[test]
+    fn cidr_v6_link_local_fe80_10() {
+        // fe80::/10: top 10 bits = 1111111010 → first word mask = 0xFFC0_0000
+        let r = parse_one_cidr("fe80::/10").unwrap();
+        assert_eq!(r.family, libc::AF_INET6 as u32);
+        assert_eq!(r.addr[0], 0xFE80_0000);
+        assert_eq!(r.mask[0], 0xFFC0_0000);
+        assert_eq!(r.mask[1..], [0, 0, 0]);
+    }
+
+    #[test]
+    fn cidr_v6_ula_fc00_7() {
+        // fc00::/7: top 7 bits = 1111110 → first word mask = 0xFE00_0000
+        let r = parse_one_cidr("fc00::/7").unwrap();
+        assert_eq!(r.addr[0], 0xFC00_0000);
+        assert_eq!(r.mask[0], 0xFE00_0000);
+    }
+
+    #[test]
+    fn cidr_v6_strict_rejects_host_bits() {
+        // ::abcd/64 has host bits below the /64
+        let err = parse_one_cidr("::abcd/64").unwrap_err().to_string();
+        assert!(err.contains("Did you mean"), "msg = {err}");
+        // fe80::1/10 (last word non-zero) likewise
+        let err = parse_one_cidr("fe80::1/10").unwrap_err().to_string();
+        assert!(err.contains("fe80::/10"), "msg = {err}");
+    }
+
+    #[test]
+    fn cidr_v6_prefix_bounds() {
+        assert!(parse_one_cidr("::1/129").is_err());
+        assert!(parse_one_cidr("::/0").is_ok());
+    }
+
+    #[test]
+    fn cidr_malformed() {
+        assert!(parse_one_cidr("abc").is_err());           // no slash
+        assert!(parse_one_cidr("10.0.0.0").is_err());      // no slash
+        assert!(parse_one_cidr("10.0.0.0/").is_err());     // empty prefix
+        assert!(parse_one_cidr("10.0.0.0/x").is_err());    // non-numeric prefix
+        assert!(parse_one_cidr("999.0.0.0/8").is_err());   // bad ipv4 octet
+    }
+
+    #[test]
+    fn skip_subnet_list() {
+        let v = parse_skip_subnet(
+            "127.0.0.0/8, 10.0.0.0/8 ,192.168.0.0/16,::1/128,fe80::/10",
+        )
+        .unwrap();
+        assert_eq!(v.len(), 5);
+        assert_eq!(v[0].family, libc::AF_INET as u32);
+        assert_eq!(v[3].family, libc::AF_INET6 as u32);
+    }
+
+    #[test]
+    fn skip_subnet_empty_is_zero_rules() {
+        assert_eq!(parse_skip_subnet("").unwrap().len(), 0);
+        assert_eq!(parse_skip_subnet("   ").unwrap().len(), 0);
+        assert_eq!(parse_skip_subnet(",,,").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn skip_subnet_bails_on_any_bad_entry() {
+        // First entry is fine, second has host bits set → entire parse fails.
+        let err = parse_skip_subnet("10.0.0.0/8,192.168.1.0/16")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("192.168.0.0/16"), "msg = {err}");
     }
 }

@@ -198,6 +198,18 @@ cwnd 从初始低位爬升需要几分钟。期间吞吐暴跌(8 Gbps → 49 Mbp
 把"忘记"从"silent loss of protection"变成"accel 直接无法启动"。
 **适用范式**: 任何"所有算法都必须做的事"(类似公共安全策略)。
 
+升级路线 (2.5-D7+ skip_subnet):
+
+最初做的是 bool `skip_local` (硬编码 RFC1918/loopback 列表),后用户指出
+不够灵活 (有人有 Tailscale CGNAT、自建 VPN 内网等),改成用户填 CIDR 列表
+`skip_subnet`。BPF 端结构体扩到 40 字节/规则、32 条上限、Rust 端预算 mask
+(避免 BPF 内条件位运算),v4 + v6 都支持,daddr + saddr 都查。**严格 CIDR
+校验**:host bits 越界 → 启动 bail 并指出规范化形式 (生产安全:不容忍歧义
+配置)。
+
+CIDR 解析 13 个单元测试覆盖:v4 基本 + 边界 (/0, /32) + 严格拒绝 host bits
++ v6 ::1/fe80::/fc00:: + v6 边界 + 列表分隔 + 单条错全停。
+
 ### 5.14 preflight 检查只覆盖硬故障,不做完整 doctor
 
 环境检查机制设计权衡过(2.5-D7 阶段):全功能 `./accel doctor` 子命令是过度设计 ——
