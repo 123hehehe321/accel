@@ -57,19 +57,19 @@ fn print_usage() {
 
 fn run_status() -> Result<()> {
     let cfg = config::load(Path::new(CONFIG_PATH))?;
-    let sock = socket::resolve_path(&cfg.runtime.socket);
+    let sock = socket::resolve_client_path(&cfg.runtime.socket);
     socket::client_roundtrip(&sock, "status")
 }
 
 fn run_stop() -> Result<()> {
     let cfg = config::load(Path::new(CONFIG_PATH))?;
-    let sock = socket::resolve_path(&cfg.runtime.socket);
+    let sock = socket::resolve_client_path(&cfg.runtime.socket);
     socket::client_roundtrip(&sock, "stop")
 }
 
 fn run_algo(args: &[String]) -> Result<()> {
     let cfg = config::load(Path::new(CONFIG_PATH))?;
-    let sock = socket::resolve_path(&cfg.runtime.socket);
+    let sock = socket::resolve_client_path(&cfg.runtime.socket);
     match args.first().map(String::as_str) {
         Some("list") => socket::client_roundtrip(&sock, "algo_list"),
         Some("switch") => {

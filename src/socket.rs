@@ -27,6 +27,24 @@ pub fn resolve_path(cfg_socket: &str) -> PathBuf {
     PathBuf::from("./accel.sock")
 }
 
+/// Client-side socket resolver. Same `cfg_socket` precedence as
+/// `resolve_path`, but when the user left `socket = ""` we cannot rely
+/// on INVOCATION_ID — that env var is set on the daemon by systemd, not
+/// inherited by an interactive `./accel status` started later from the
+/// shell. Fall back to probing /run/accel/accel.sock first (where the
+/// systemd-launched daemon binds), then to ./accel.sock (manual launch
+/// in the binary's directory).
+pub fn resolve_client_path(cfg_socket: &str) -> PathBuf {
+    if !cfg_socket.is_empty() {
+        return PathBuf::from(cfg_socket);
+    }
+    let run_path = PathBuf::from("/run/accel/accel.sock");
+    if run_path.exists() {
+        return run_path;
+    }
+    PathBuf::from("./accel.sock")
+}
+
 /// Startup-time check: if the socket file exists and a listener is there,
 /// another accel is already running. If the file exists but connect fails,
 /// it's stale — we unlink so bind can succeed.
