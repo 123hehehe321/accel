@@ -2,7 +2,32 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix6)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix7)
+
+- **md5**: `525350236166e0caac2cff43562c4f3e` (1330344 bytes)
+- **2.5-D7 fix7 (counter 改 first-ACK gate + 显示稳态化)**:
+  fix5 加的 `display_count` "cross-CPU drift" 兜底在 fix7 binary 上**应该
+  再也不触发**;`smart state:` 那行**永远显示**(无活跃 sock 时显示
+  `(no active accelerated sockets)`,不会整行消失)。
+  - **真因**:kernel TCP cong-control 的 `init`/`release` 不严格 1:1
+    (TFO 回滚、SYN cookie 提升、setsockopt 在 CLOSED 上换 CC、
+    disconnect、各种 mini-sock 路径)。fix4 改 PERCPU 只解决了单 CPU
+    数据竞争,跨 CPU 生命周期不平衡仍让 counter wrap 成 `u64::MAX-N`,
+    显示成天文数字。同时 state_count 三槽都 wrap 时,旧 status.rs 的
+    `if total > 0` 判断让整行消失。
+  - **修法**:counter 操作从 `init`/`release` 移到 **第一次 cong_main**
+    触发时(`smart_priv` / `brutal_priv` 加 `__u8 counted` 标记位)。
+    cong_main 只在 sk 真处理 ACK 时跑,kernel 内部生命周期路径都不
+    会触碰 counter,init/release 不平衡天然消失。
+  - **副作用清理**:`status.rs::display_count` / `sane_count` /
+    `COUNTER_SANE_MAX` **全部删除**(死代码);`smart state:` 渲染
+    改成无条件,加 `(no active accelerated sockets)` 兜底分支。
+  - **brutal 同步处理**:同一个 first-ACK gate 范式,brutal 也改了
+    (避免未来 brutal 主算法时复发)。
+  - **审计 PASS**:`cargo clippy --release --all-targets -D warnings`
+    全部通过;17/17 单元测试通过。
+
+## 历史版本: 2.5-smart-D7 (fix6)
 
 - **2.5-D7 fix6 (上限放宽 + 死代码清理)**:
   - **`duplicate_factor` 上限 8 → 100**。极端环境(卫星 / 严重退化的
