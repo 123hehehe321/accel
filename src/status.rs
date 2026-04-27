@@ -54,6 +54,12 @@ pub struct State {
     /// `[smart]` section validated. Consumed by health.rs to re-apply
     /// config + dup_config + tc attach after a smart reload.
     pub smart_saved: Option<SmartSavedCfg>,
+    /// Parsed `skip_subnet` rules captured at startup. Consumed by
+    /// health.rs to re-apply the skip-list after ANY algorithm reload
+    /// (a freshly-loaded BPF map starts empty — every connection
+    /// would match no rule and get rate-limited, including local /
+    /// intranet traffic). All algorithms get the same rule list.
+    pub skip_rules: Vec<crate::ebpf_loader::SkipRule>,
     pub health_shutting_down: AtomicBool,
     pub health_last_ok: Mutex<Option<Instant>>,
     pub jit_warned: AtomicBool,

@@ -126,7 +126,7 @@ fn reload_one(state: &State, name: &str) {
     // reload, so they're zero by default), then re-attach the tc-bpf egress
     // filter (the old hook was detached when the prior LoadedSmart dropped).
     // state.smart_saved is set at startup iff target was accel_smart.
-    let new_algo = if name == "accel_smart" {
+    let mut new_algo = if name == "accel_smart" {
         if let Some(saved) = state.smart_saved.as_ref() {
             let mut a = new_algo;
             match &mut a {
@@ -157,6 +157,22 @@ fn reload_one(state: &State, name: &str) {
     } else {
         new_algo
     };
+
+    // CRITICAL: re-apply the skip-subnet rules. The newly-loaded BPF
+    // map is empty (count=0), which means should_skip() returns 0 for
+    // every socket, which means LOCAL/INTRANET connections would be
+    // rate-limited until the next acc.conf reload. Production safety:
+    // every algo reload reapplies these rules, exhaustively over every
+    // LoadedAlgo variant (compile-time check that new variants don't
+    // skip this step).
+    let skip_result = match &mut new_algo {
+        LoadedAlgo::Cubic(c) => c.set_skip(&state.skip_rules),
+        LoadedAlgo::Brutal(b) => b.set_skip(&state.skip_rules),
+        LoadedAlgo::Smart(s) => s.set_skip(&state.skip_rules),
+    };
+    if let Err(e) = skip_result {
+        eprintln!("health: re-apply skip_subnet after {name} reload failed: {e:#}");
+    }
 
     algos.insert(name.to_string(), new_algo);
     drop(algos); // release before sysctl side-effect

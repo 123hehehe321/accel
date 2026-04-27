@@ -345,6 +345,7 @@ fn run_server() -> Result<()> {
         original_cc_ipv6,
         brutal_rate_mbps,
         smart_saved,
+        skip_rules,
         health_shutting_down: AtomicBool::new(false),
         health_last_ok: Mutex::new(None),
         jit_warned: AtomicBool::new(false),
