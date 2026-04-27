@@ -2,7 +2,30 @@
 
 这个分支只放编译好的二进制 + 配置示例 + 验收脚本。源代码在 `main` 分支。
 
-## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix4)
+## 当前版本: 2.5-smart-D7 (glibc 2.34 build, fix5)
+
+- **2.5-D7 fix5 (smart 算法精简 + 多倍发包可配 + 计数显示稳健化)**:
+  用户实测 VPN/4K 直播加速时 smart 表现远不如 brutal,status 显示
+  CONGEST 占 83%。三处改动:
+  - **(A) 删除 rtt_congest_pct 配置项 + RTT 判定逻辑**(死代码不留)。
+    隧道场景 srtt 远大于 min_rtt(min_rtt 在握手时锁定不更新),
+    导致 RTT 比例永远大,smart 永远误判 CONGEST → 主动降速 →
+    跑不快。fix5 起 smart **完全靠丢包判定**:
+       loss < lossy/2     → GOOD(brutal 行为,满速)
+       lossy ≤ loss < congest → LOSSY(BDP+pacing+多倍发包)
+       loss ≥ congest     → CONGEST(让路)
+  - **(B) duplicate_factor 配置项**(默认 2,范围 1..=8)。
+    LOSSY 状态下每个 TCP 包发几份,以前是固定 2 份,现在用户可调。
+    丢包重的链路可设 3-5 倍补偿;1 = 关闭克隆退化为单纯算法。
+    BPF 端 `#pragma unroll` 静态展开,verifier 风险固定。
+  - **(C) status 显示稳健化**: smart sockets / smart state 显示了
+    18446744073709551509 这种天文数字(跨 CPU init/release 不平衡导致
+    sum 偏负 wrap)。新版本 `display_count` 把 `> u64::MAX/2` 的值
+    显示为 `0 (likely cross-CPU drift; raw sum=0xXXXX)`,操作员不会
+    被误导。**注意**:这是 UX 修复,不解决底层 drift,但生产环境看
+    数字不再吓人。
+
+## 历史版本: 2.5-smart-D7 (fix4)
 
 - **2.5-D7 fix4 (生产关键 bug 修复 + LPM_TRIE 重构)**:
   - **(A) BPF 计数器下溢竞态**: D7 真业务流量下出现
@@ -383,8 +406,8 @@ sudo ./verify-2.3.sh G     # cubic 回归
 
 ## binary 信息
 
-- **accel MD5**: `4257b7fee88ba9d5718037c0d1e9675f`
-- **accel 大小**: 1,322,520 字节
+- **accel MD5**: `2fd644e0fd1c7a32308cec3b3528b744`
+- **accel 大小**: 1,323,000 字节
 - **glibc 底线**: GLIBC_2.34
 - **构建**: Ubuntu 22.04 docker 容器, Rust 1.94.1, clang 14
 - **新增**: preflight 启动检查 + LOSSY BDP+pacing + 客户端 socket 自动探测 + skip_subnet 用 LPM_TRIE + 计数器 PERCPU_ARRAY 修下溢
