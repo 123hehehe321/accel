@@ -4,16 +4,33 @@
 
 ---
 
-## 1. 项目当前状态(2026-04-26)
+## 1. 项目当前状态(2026-04-27)
 
-- **版本**:v0.2 / **2.5 D1-D7 完成,等用户实际跨境流量反馈**
-- **支持算法**:`accel_cubic`(基线) + `accel_brutal`(激进) + **`accel_smart`(2.5 新增,自适应)**
-- **代码量**:~3700 行 / 3000 预算(用户拍板放宽,2.6+ 严控)
-- **2.5 收尾源 commit**:`claude/accel-smart` 上的 preflight commit(待最终编号)
-- **2.5 收尾 binaries commit**:见 binaries 分支 README
+- **版本**:v0.2 / **2.5-D7 fix6 完成,生产部署 + 长跑观察阶段**
+- **支持算法**:`accel_cubic`(基线) + `accel_brutal`(激进) + **`accel_smart`(2.5 新增,纯丢包自适应)**
+- **代码量**:~3850 行 / 3000 预算(用户拍板放宽,2.6+ 严控)
+- **当前源分支 tip**:`claude/accel-smart` `f331264` (fix6)
+- **当前 binaries tip**:`5790594` (fix6) / accel md5 `09f9d7cdac0428492279359b47d6a9a5`
 
 历史里程碑:
-- 2.3 收官 commit: main `78b7680` / binaries `7617cf8` / binary md5 `f14594ac59d737df516a0dd32dacf8b3`
+- 2.3 收官:main `78b7680` / binaries `7617cf8` / binary md5 `f14594ac59d737df516a0dd32dacf8b3`
+- 2.5 收尾(2026-04-27 fix6): 见上
+
+### 2.5 fix 时序(D7 之后的真业务流量驱动迭代)
+
+| 修复 | 关键问题 | 解决方案 |
+|---|---|---|
+| fix1 | 客户端命令在 systemd 部署下找不到 socket | `socket.rs::resolve_client_path` 探测 `/run/accel/accel.sock` 后回退 |
+| fix2 | 内网 / 回环连接被 brutal/smart 错误限速 | `skip_local = true` bool 开关 + 硬编码 RFC1918 列表 |
+| fix3 | skip_local 不灵活(用户有 Tailscale / 自建 VPN) | 改成 `skip_subnet = "..."` CIDR 列表,严格校验 host bits |
+| fix3a | 算法被外部 unregister 自愈 reload 时丢 skip | `State::skip_rules` + health.rs reload 重写 set_skip |
+| fix4 | (A) ARRAY map check-then-decrement 多核竞态 → counter 下溢 | 全 counter 改 `BPF_MAP_TYPE_PERCPU_ARRAY` |
+| fix4 | (B) skip_subnet 32-array unrolled loop 撞 verifier path explosion 风险 | 改用 `BPF_MAP_TYPE_LPM_TRIE` (BPF 内核 CIDR 标准结构) |
+| fix5 | smart 在 VPN/4K 测试 CONGEST 占 83%,不如 brutal | 删除 `rtt_congest_pct` 全部代码 + 逻辑 → 纯丢包判定 |
+| fix5 | 多倍发包硬编码 2x | 加 `duplicate_factor` 配置,默认 2,范围 1..=8 |
+| fix5 | smart sockets 显示天文数字(跨 CPU drift) | `display_count` 用户态兜底显示 0 |
+| fix6 | dup_factor 8 上限不够极端环境 | 上限 8 → 100 |
+| fix6 | 全代码审计 | 删 `accel_brutal::max_t` 死宏 + cli redundant clone + unwrap → if let |
 
 ---
 
@@ -183,7 +200,7 @@ cwnd 从初始低位爬升需要几分钟。期间吞吐暴跌(8 Gbps → 49 Mbp
 - LOSSY:`cwnd = BDP`(可升可降,跟随带宽);pacing = 100% bw
 - CONGEST:`cwnd = min(cwnd, BDP)`(只降不升,主动让路);pacing = 50% drain → 90% cruise
 
-### 5.13c BPF counter race → percpu map
+### 5.13c BPF counter race → percpu map (fix4)
 
 D7 真业务流量下发现 `smart sockets: 18446744073709549559`(约 `u64::MAX - 2057`)
 ——典型的整数下溢。原因是 ARRAY map 加 `if (*cnt > 0) __sync_fetch_and_sub` 这种
@@ -206,9 +223,37 @@ D7 真业务流量下发现 `smart sockets: 18446744073709549559`(约 `u64::MAX 
 release 在 CPU 5,CPU 0 +1、CPU 5 -1 → CPU 5 = u64::MAX),u64 模 2^64 加法保证
 sum 还原正确值。
 
+**fix5 后续观察**:即使切到 percpu,生产环境仍偶发跨 CPU 不平衡(疑似 kernel
+struct_ops 边界 callback 不严格对称,如 LISTEN socket / SYN cookie 路径)。
+**status.rs 加 `display_count` 兜底**:`> u64::MAX/2` 显示为 `0 (likely
+cross-CPU drift; raw sum=0xXXXX)`。这是 UX 修复,不解决底层不对称,但生产看
+数字不会被 18 位天文数字误导。
+
 **通用教训**:BPF 内任何 "check 然后 mutate" 的两步操作都有竞态。要么用 atomic
 CAS 循环(verifier 难过),要么用 percpu map(简单且 verifier 友好)。计数器场景
-默认选 percpu。
+默认选 percpu。再加用户态 saturating display 兜底,生产显示永远不出离谱数字。
+
+### 5.13d 算法分类信号选择 = 看场景,不要复杂(fix5)
+
+最初 smart 用"丢包率 + RTT 膨胀"双信号判定 CONGEST。设计直觉:**真拥塞时
+RTT 会涨**(buffer 排队),**噪音性丢包 RTT 不变**。但 D7 真业务(VPN 隧道
+跨境 4K 直播)实测 CONGEST 占 83%,smart 远不如 brutal:
+
+1. `tcp_min_rtt()` 在握手时锁定低值不更新,任何持续业务的 srtt 都会比 min_rtt
+   大几倍 → ratio 永远爆表
+2. 隧道 / VPN 自身就有排队抖动,srtt 抖动跟拥塞无关
+3. 一旦进 CONGEST 就 BDP 收敛 + drain pacing,自我加强死循环
+
+**教训**:
+- 拥塞信号在干净数据中心环境靠谱,**在加密隧道 + 跨境** 全失效
+- 写算法**不要追求"完美的多信号融合"**,先验证每个信号在目标场景的可靠性
+- 简单的纯丢包判定在跨境场景**远强于**带 RTT 信号
+
+fix5 起 smart 删除 `rtt_congest_pct` 配置项 + 整段 RTT 比对逻辑(死代码不留)。
+分类只看 EWMA 丢包率。
+
+**适用范式**:任何"在领域 X 看似有用的信号"在领域 Y 可能是噪音。算法设计前
+**先想"这个信号在我的目标用例里干净吗"**,再决定要不要写进代码。
 
 ### 5.13b skip_subnet 设计弯路:从 unrolled-loop 撤回到 LPM_TRIE
 
@@ -294,8 +339,8 @@ accel 收 SIGHUP 死掉(2.3 未处理 systemd 集成)。建议 `nohup ./accel &`
 | **2.1** | accel_cubic 基线 + Bug 1/2 | main `adaf625` / binary `acc28784...` |
 | **2.2 BBR** | 探索后放弃(用户洞察:用户可直接 sysctl bbr,不值得做)| WIP `7133987`(历史保留) |
 | **2.3 brutal** | 自写 BPF struct_ops,5 轮 verifier 撞坑修复 | main `78b7680` / binary `f14594ac...` |
-| **2.5 smart** | 自适应算法 + tc-bpf 多倍发包,D1-D7 完成 | claude/accel-smart 分支 |
-| **2.6+** | **未启动**,等 2.5 真业务流量反馈 | - |
+| **2.5 smart** | 自适应算法 + tc-bpf 多倍发包,D1-D7 + fix1-fix6 完成 | claude/accel-smart `f331264` / binaries `5790594` / md5 `09f9d7cd...` |
+| **2.6+** | **未启动**,等 2.5-fix6 真业务流量反馈 | - |
 
 ### 2.5 smart 阶段细分
 
@@ -309,21 +354,30 @@ accel 收 SIGHUP 死掉(2.3 未处理 systemd 集成)。建议 `nohup ./accel &`
 | D6 | netns + veth + netem 集成测试 (PARTIAL: LOSSY 在 veth 测不出) | binaries `1fffd4d` |
 | LOSSY 升级 | reno → BDP+pacing(D6 暴露的问题) | `ed36e3e` |
 | D7 | preflight + acc.conf.example + 文档 + 部署脚本 | `0aec35f` |
-| socket fix | client 自动探测 /run/accel/accel.sock | `efb8ba8` |
-| skip_local | 内网/回环连接绕过限速 (accel_common.h 范式) | (本次 commit) |
+| fix1 | client 自动探测 /run/accel/accel.sock | `efb8ba8` |
+| fix2 | bool `skip_local` 硬编码 RFC1918 列表 | (intermediate) |
+| fix3 | `skip_subnet = "..."` CIDR 列表 + 严格校验 + accel_common.h 范式 | (intermediate) |
+| fix4 | PERCPU counter + LPM_TRIE skip_subnet | (intermediate) |
+| fix5 | 删除 rtt_congest_pct + duplicate_factor 配置 + display_count UX 兜底 | (intermediate) |
+| fix6 | dup_factor 上限 100 + 全代码审计 (删死宏 / unwrap 改 if let) | `f331264` / binaries `5790594` |
 
-### 2.5 smart 算法核心思路
+### 2.5 smart 算法核心思路(fix5 起,纯丢包判定)
 
 3 状态自适应:
 - **GOOD**(干净链路): brutal 行为(rate × cwnd_gain × 80% ack-rate clamp)
-- **LOSSY**(噪音性丢包): BDP 估算 + 100% pacing + tc-bpf 多倍发包补偿
+- **LOSSY**(噪音性丢包): BDP 估算 + 100% pacing + tc-bpf N 倍发包补偿(`duplicate_factor` 1..=100,默认 2)
 - **CONGEST**(真拥塞): BDP 收敛(只降不升)+ 50% drain pacing → 90% cruise pacing
 
-分类信号:
+分类信号(单一):
 - `loss_ewma_bp`(EWMA α=1/8 over 5 秒窗口聚合 acked/losses)
-- `srtt/min_rtt` 比例(RTT 膨胀)
+- `loss_lossy_bp` / `loss_congest_bp` 两个阈值,中间夹层 = LOSSY,以上 = CONGEST,以下 = GOOD
 - 200ms 最小驻留(滞后区防抖)
-- 双信号交叉:单个极强信号(loss ≥ 15% 或 RTT 膨胀 ≥ 50%)→ CONGEST
+- **不再用 RTT 信号**(fix5,见 §5.13d):VPN/隧道/跨境场景 RTT 不可靠,且 `tcp_min_rtt()` 锁定握手值不更新
+
+skip 机制(fix3+fix4):
+- `skip_subnet = "10.0.0.0/8, 192.168.0.0/16, ..."` 用户填 CIDR 列表,v4 + v6 混合
+- BPF 端用 `BPF_MAP_TYPE_LPM_TRIE`(2 次 lookup,O(log n))
+- 命中则**不走 accel 算法**(daddr 或 saddr 任意一个匹配即跳过)
 
 ---
 
@@ -351,17 +405,27 @@ accel 收 SIGHUP 死掉(2.3 未处理 systemd 集成)。建议 `nohup ./accel &`
 
 ## 9. 当前阻塞 / 下一步
 
-**无阻塞**。当前(2.5-D7)等用户实际跨境业务流量反馈:
-- `./accel status` 中 smart state 分布是否合理(GOOD 主导,LOSSY 偶现,CONGEST 罕见)
+**无阻塞**。当前(2.5-D7 fix6)等用户在 fix6 binary 上跑真业务流量复测:
+- `./accel status` 中 smart state 分布是否合理
+  - 期望(纯丢包判定后):GOOD 占 80%+,LOSSY 在隧道/跨境出现,CONGEST 仅在真排队拥塞时
+  - 不期望:CONGEST 长期占比 > 50%(fix5 前的 83% 已通过删 RTT 信号修掉)
+- `smart sockets:` 数字应是合理值(fix5 的 display_count 兜底:跨 CPU drift 时显示 `0 (likely cross-CPU drift; raw sum=0xXXXX)`)
+- `smart dup factor:` 行展示当前倍数 + LOSSY 解释
 - `accel-incidents.log` 有无异常增长
 - 业务体感(SSH / haproxy / nginx / v2ray)是否比 brutal 更顺(尤其丢包高峰期)
 - `d7-monitor.sh` 跑 5 分钟 / 1 小时 / 24 小时三个快照
+
+跨 CPU drift 后续(fix5 已加显示兜底,但根因未查清):
+- 怀疑 kernel struct_ops 边界 callback 不严格对称(LISTEN socket / SYN cookie 路径)
+- 当前不影响生产(percpu wrap 数学正确 + UX 兜底),只是有少量 raw_sum 大数
+- 真要根治需要内核侧调研,2.6+ 视情况
 
 可能的 2.6 方向(优先级待定):
 1. AI 调节接口(`smart_config_map` 已暴露给用户态,运行时可写)
 2. systemd unit / 自动启动
 3. status 输出补充(per-state cwnd / pacing 平均)
 4. 多接口 tc-bpf 支持(当前只支持单 interface)
+5. LPM_TRIE 容量从 256 扩到 1024(若用户有真需求)
 
 ---
 
@@ -412,6 +476,6 @@ accel 收 SIGHUP 死掉(2.3 未处理 systemd 集成)。建议 `nohup ./accel &`
 
 ---
 
-**最后更新**:2026-04-25(2.3 收官)
+**最后更新**:2026-04-27(2.5-D7 fix6 收官)
 
-**下次更新触发**:2.4 启动 / 重大架构变更 / 核心原则调整
+**下次更新触发**:2.6 启动 / 重大架构变更 / 核心原则调整
