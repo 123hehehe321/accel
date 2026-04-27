@@ -109,22 +109,20 @@ impl LoadedBrutal {
     }
 
     /// Read the current count of accel_brutal-managed sockets from the
-    /// `brutal_socket_count` map. The map is bumped/decremented atomically
-    /// by the BPF init/release callbacks.
+    /// `brutal_socket_count` per-CPU map. Sums every CPU's slot —
+    /// individual slots may have wrapped past u64::MAX (a socket
+    /// init'd on CPU A can release on CPU B), but the sum mod 2^64
+    /// recovers the correct global count.
     pub fn socket_count(&self) -> Result<u64> {
         let key: u32 = 0;
-        let bytes = self
+        let percpu = self
             .skel
             .maps
             .brutal_socket_count
-            .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+            .lookup_percpu(&key.to_ne_bytes(), MapFlags::ANY)
             .context("looking up brutal_socket_count")?
             .ok_or_else(|| anyhow!("brutal_socket_count missing key 0"))?;
-        let arr: [u8; 8] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("brutal_socket_count value len {} (want 8)", bytes.len()))?;
-        Ok(u64::from_ne_bytes(arr))
+        sum_percpu_u64(&percpu, "brutal_socket_count")
     }
 }
 
@@ -293,45 +291,34 @@ impl LoadedSmart {
         Ok(())
     }
 
-    /// Total accel_smart-managed sockets currently alive. Bumped in
-    /// smart_init, decremented in smart_release.
+    /// Total accel_smart-managed sockets currently alive. Sums the
+    /// per-CPU `smart_socket_count` array.
     pub fn socket_count(&self) -> Result<u64> {
         let key: u32 = 0;
-        let bytes = self
+        let percpu = self
             .skel
             .maps
             .smart_socket_count
-            .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+            .lookup_percpu(&key.to_ne_bytes(), MapFlags::ANY)
             .context("looking up smart_socket_count")?
             .ok_or_else(|| anyhow!("smart_socket_count missing key 0"))?;
-        let arr: [u8; 8] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("smart_socket_count value len {} (want 8)", bytes.len()))?;
-        Ok(u64::from_ne_bytes(arr))
+        sum_percpu_u64(&percpu, "smart_socket_count")
     }
 
-    /// Per-state population: `[GOOD, LOSSY, CONGEST]`. Updated by the
-    /// struct_ops half on each state transition that survives the
-    /// 200ms minimum-dwell hysteresis.
+    /// Per-state population: `[GOOD, LOSSY, CONGEST]`. Each element is
+    /// summed across CPUs from the `smart_state_count` per-CPU array.
     pub fn state_counts(&self) -> Result<[u64; 3]> {
         let mut out = [0u64; 3];
         for (i, slot) in out.iter_mut().enumerate() {
             let key: u32 = i as u32;
-            let bytes = self
+            let percpu = self
                 .skel
                 .maps
                 .smart_state_count
-                .lookup(&key.to_ne_bytes(), MapFlags::ANY)
+                .lookup_percpu(&key.to_ne_bytes(), MapFlags::ANY)
                 .with_context(|| format!("looking up smart_state_count[{i}]"))?
                 .ok_or_else(|| anyhow!("smart_state_count missing key {i}"))?;
-            let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
-                anyhow!(
-                    "smart_state_count[{i}] value len {} (want 8)",
-                    bytes.len()
-                )
-            })?;
-            *slot = u64::from_ne_bytes(arr);
+            *slot = sum_percpu_u64(&percpu, &format!("smart_state_count[{i}]"))?;
         }
         Ok(out)
     }
@@ -619,6 +606,29 @@ fn write_skip_config(
     }
 
     Ok(())
+}
+
+/// Sum a per-CPU u64 counter map's values across all online CPUs.
+///
+/// Modular-arithmetic note: a socket may be init'd on one CPU and
+/// released on another, so any individual CPU's slot can drift past
+/// u64::MAX (i.e. wrap around). The wrapping_add chain still recovers
+/// the correct global count because (a + b) mod 2^64 across all
+/// per-CPU contributions equals the true count whenever init/release
+/// balance globally — which they do by construction (`if (b->skip)
+/// return;` symmetry).
+fn sum_percpu_u64(percpu: &[Vec<u8>], context_name: &str) -> Result<u64> {
+    let mut total: u64 = 0;
+    for (cpu, bytes) in percpu.iter().enumerate() {
+        let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow!(
+                "{context_name}[cpu {cpu}] value len {} (want 8)",
+                bytes.len()
+            )
+        })?;
+        total = total.wrapping_add(u64::from_ne_bytes(arr));
+    }
+    Ok(total)
 }
 
 /// Build-time probe printed during startup banner — confirms both

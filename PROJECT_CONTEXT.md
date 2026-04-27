@@ -183,6 +183,33 @@ cwnd 从初始低位爬升需要几分钟。期间吞吐暴跌(8 Gbps → 49 Mbp
 - LOSSY:`cwnd = BDP`(可升可降,跟随带宽);pacing = 100% bw
 - CONGEST:`cwnd = min(cwnd, BDP)`(只降不升,主动让路);pacing = 50% drain → 90% cruise
 
+### 5.13c BPF counter race → percpu map
+
+D7 真业务流量下发现 `smart sockets: 18446744073709549559`(约 `u64::MAX - 2057`)
+——典型的整数下溢。原因是 ARRAY map 加 `if (*cnt > 0) __sync_fetch_and_sub` 这种
+"check-then-decrement"非原子,多核并发 release 时会双减:
+
+  CPU A 看到 cnt=1,通过 `> 0` 检查
+  CPU B 看到 cnt=1,通过 `> 0` 检查
+  CPU A 减 1 → 0
+  CPU B 减 1 → wrap to 2^64-1
+
+累计触发 2057 次后看到这个数。**不是 transient off-by-one**(原来 brutal 注释这么
+说的太乐观了),是真实的累积下溢。
+
+**修复:用 `BPF_MAP_TYPE_PERCPU_ARRAY`**:每个 CPU 一份独立 slot,内核在 BPF prog
+执行期间 disable 抢占,单 CPU 内访问串行化,**不需要任何原子前缀**。BPF 端代码
+变成 `(*cnt)++` / `(*cnt)--`,简洁 + 无 race。
+
+用户态读取:`map.lookup_percpu(key, ...)` 返回 `Vec<Vec<u8>>`,遍历用
+`wrapping_add` 累加。即使某个 CPU 的 slot 单独看下溢了(socket A init 在 CPU 0,
+release 在 CPU 5,CPU 0 +1、CPU 5 -1 → CPU 5 = u64::MAX),u64 模 2^64 加法保证
+sum 还原正确值。
+
+**通用教训**:BPF 内任何 "check 然后 mutate" 的两步操作都有竞态。要么用 atomic
+CAS 循环(verifier 难过),要么用 percpu map(简单且 verifier 友好)。计数器场景
+默认选 percpu。
+
 ### 5.13b skip_subnet 设计弯路:从 unrolled-loop 撤回到 LPM_TRIE
 
 最早 skip_subnet 的 BPF 实现是"32-entry rule 数组 + `#pragma unroll`"——简单粗暴但

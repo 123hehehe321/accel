@@ -109,8 +109,13 @@ struct {
 } smart_config_map SEC(".maps");
 
 /* +1 in init, -1 in release. status reads. */
+/* PERCPU_ARRAY rationale: see brutal's same comment. Per-CPU slots are
+ * single-threaded inside BPF (preemption disabled), so init / release /
+ * state-transition increments and decrements need no atomic prefix.
+ * Per-CPU drift is fine because userspace sums across CPUs and the
+ * sum recovers the correct global count via u64 modular arithmetic. */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, __u64);
@@ -118,7 +123,7 @@ struct {
 
 /* Per-state population. keys 0/1/2 = GOOD/LOSSY/CONGEST. status reads. */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 3);
 	__type(key, __u32);
 	__type(value, __u64);
@@ -428,14 +433,17 @@ void BPF_PROG(smart_init, struct sock *sk)
 	 * time cong_control sets sk_pacing_rate (which smart does in
 	 * GOOD/CONGEST paths). LOSSY leaves pacing to the kernel default. */
 
+	/* PERCPU_ARRAY: this CPU's slots are mutated single-threadedly. No
+	 * atomic prefix needed; userspace sums across CPUs. See map decl
+	 * comment for the underflow-via-modular-arithmetic argument. */
 	__u32 zero = 0;
 	__u64 *cnt = bpf_map_lookup_elem(&smart_socket_count, &zero);
 	if (cnt)
-		__sync_fetch_and_add(cnt, 1);
+		(*cnt)++;
 
 	__u64 *good = bpf_map_lookup_elem(&smart_state_count, &zero);
 	if (good)
-		__sync_fetch_and_add(good, 1);
+		(*good)++;
 }
 
 SEC("struct_ops")
@@ -448,14 +456,14 @@ void BPF_PROG(smart_release, struct sock *sk)
 
 	__u32 zero = 0;
 	__u64 *cnt = bpf_map_lookup_elem(&smart_socket_count, &zero);
-	if (cnt && *cnt > 0)
-		__sync_fetch_and_sub(cnt, 1);
+	if (cnt)
+		(*cnt)--;
 
 	__u32 state_key = p->state;
 	if (state_key <= LINK_CONGEST) {
 		__u64 *sc = bpf_map_lookup_elem(&smart_state_count, &state_key);
-		if (sc && *sc > 0)
-			__sync_fetch_and_sub(sc, 1);
+		if (sc)
+			(*sc)--;
 	}
 }
 
@@ -505,12 +513,12 @@ __u32 BPF_PROG(smart_main, struct sock *sk, __u32 ack, int flag,
 
 			__u64 *old_sc = bpf_map_lookup_elem(&smart_state_count,
 							    &old_key);
-			if (old_sc && *old_sc > 0)
-				__sync_fetch_and_sub(old_sc, 1);
+			if (old_sc)
+				(*old_sc)--;
 			__u64 *new_sc = bpf_map_lookup_elem(&smart_state_count,
 							    &new_key);
 			if (new_sc)
-				__sync_fetch_and_add(new_sc, 1);
+				(*new_sc)++;
 
 			p->state = new_state;
 			p->last_change = now;

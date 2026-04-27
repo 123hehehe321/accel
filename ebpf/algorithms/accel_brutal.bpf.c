@@ -88,9 +88,29 @@ struct {
 } brutal_rate_config SEC(".maps");
 
 /* Number of sockets currently using accel_brutal. Bumped in init,
- * decremented in release. Status command reads it. */
+ * decremented in release. Status command reads it.
+ *
+ * PERCPU_ARRAY: each CPU writes only its own slot, so init/release
+ * never race against each other. The previous BPF_MAP_TYPE_ARRAY +
+ * `if (*cnt > 0) __sync_fetch_and_sub` pattern looked safe but had a
+ * real race window:
+ *
+ *     CPU A: read cnt=1, pass `> 0` check
+ *     CPU B: read cnt=1, pass `> 0` check
+ *     CPU A: cnt -= 1 → 0
+ *     CPU B: cnt -= 1 → underflow → 2^64-1
+ *
+ * On a busy VPS this accumulated thousands of underflow events,
+ * producing the 18446744073709549559 figure observed in production.
+ *
+ * With PERCPU_ARRAY the kernel disables preemption while the BPF
+ * program runs, so a single CPU's slot is never concurrently mutated
+ * — `*cnt += 1` and `*cnt -= 1` need no atomic prefix. Userspace
+ * reads via `lookup_percpu()` and sums across CPUs; transient
+ * per-CPU underflows wrap modulo 2^64 and the sum still recovers the
+ * correct global count. */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
 	__type(value, __u64);
@@ -235,14 +255,13 @@ void BPF_PROG(brutal_init, struct sock *sk)
 	 * or equivalent).
 	 */
 
-	/* (4) Bump the global brutal-socket counter. ARRAY map key 0 is
-	 * always present so the lookup should never fail; even so, do not
-	 * early-return on failure — we've already mutated state above and
-	 * release will run regardless. */
+	/* (4) Bump the per-CPU brutal-socket counter. PERCPU_ARRAY: kernel
+	 * disables preemption around the BPF prog, so this CPU's slot is
+	 * mutated single-threadedly — no atomic prefix needed. */
 	__u32 zero = 0;
 	__u64 *cnt = bpf_map_lookup_elem(&brutal_socket_count, &zero);
 	if (cnt)
-		__sync_fetch_and_add(cnt, 1);
+		(*cnt)++;
 }
 
 SEC("struct_ops")
@@ -255,12 +274,12 @@ void BPF_PROG(brutal_release, struct sock *sk)
 
 	__u32 zero = 0;
 	__u64 *cnt = bpf_map_lookup_elem(&brutal_socket_count, &zero);
-	/* Underflow guard: a non-atomic check + sub may race in extreme
-	 * concurrent close storms, but a transient off-by-one is preferable
-	 * to a u64 wrap (would render status counters meaningless). The
-	 * race is tolerated per design — see VENDOR.md. */
-	if (cnt && *cnt > 0)
-		__sync_fetch_and_sub(cnt, 1);
+	/* PERCPU_ARRAY: this CPU's slot is mutated single-threadedly. A
+	 * socket may be init'd on CPU A and released on CPU B, so any one
+	 * CPU's slot can drift negative — but userspace sums across CPUs
+	 * and modular arithmetic recovers the correct global count. */
+	if (cnt)
+		(*cnt)--;
 }
 
 /* cong_control callback. BPF struct_ops verifier requires global functions
